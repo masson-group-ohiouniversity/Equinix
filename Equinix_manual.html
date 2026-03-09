@@ -581,10 +581,10 @@ transparent:             <span class="cmt"># valid: empty list — all species m
   <p>Constraints are <strong>never active by default</strong>. The <strong>Activate constraints</strong> checkbox appears in the sidebar only when a <code>$constraints</code> section is present in the script. It is unchecked on every script load. This lets you compare constrained and unconstrained fits without editing the script.</p>
 </div>
 
-<p>All modes support constraints: concentration, NMR (shift, integration, mixed), UV-Vis spectra, and kinetics (all variants). One constraint line can constrain any parameters defined in <code>$reactions</code> — equilibrium constants, forward rate constants, and reverse rate constants may all appear in the same constraint.</p>
+<p>All modes support constraints: concentration, NMR (chemical shift, integration, mixed), spectra, and kinetics (all variants). One constraint line can constrain any parameters defined in <code>$reactions</code> — equilibrium constants, forward rate constants, and reverse rate constants may all appear in the same constraint.</p>
 
 <h3 id="constraints-logspace">Log-space syntax (default)</h3>
-<p>When the expression contains only multiplication, division, or isolated parameter names — no addition or subtraction between parameters — Equinix evaluates everything in log space. Bare parameter names stand for their log₁₀ value, so arithmetic operators carry their natural log-space meaning:</p>
+<p>When the expression contains only multiplication, division, or isolated parameter names — no addition or subtraction between parameters — Equinix evaluates everything in log space.</p>
 
 <table class="kw-table">
   <thead><tr><th>Written as</th><th>Mathematical meaning</th></tr></thead>
