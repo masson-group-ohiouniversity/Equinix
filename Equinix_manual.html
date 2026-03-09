@@ -126,6 +126,11 @@
   <a href="#plot">$plot</a>
   <a href="#nmr">$nmr</a>
   <a href="#spectra">$spectra</a>
+  <a href="#constraints">$constraints</a>
+  <a class="sub" href="#constraints-logspace">Log-space syntax</a>
+  <a class="sub" href="#constraints-kspace">K-space syntax</a>
+  <a class="sub" href="#constraints-hard">Hard enforcement</a>
+  <a class="sub" href="#constraints-ui">Using the toggle</a>
 
   <span class="nav-section">Data Files</span>
   <a href="#data-conc">Concentration Data</a>
@@ -150,6 +155,7 @@
   <a href="#ex-nmr-shift">NMR Shift</a>
   <a href="#ex-nmr-integ">NMR Integration</a>
   <a href="#ex-nmr-mixed">NMR Mixed Mode</a>
+  <a href="#ex-constraints">Constraints</a>
 </nav>
 
 <main>
@@ -563,6 +569,107 @@ transparent:             <span class="cmt"># valid: empty list — all species m
   <li>Updates <strong>xmax</strong> to the x-value of the last spectrum.</li>
   <li>Populates the wavelength range boxes from the file's actual wavelength extent.</li>
 </ul>
+</section>
+
+<!-- ═══════════════════════════════════════ $CONSTRAINTS ═══════════════════════════════════════ -->
+<section id="constraints">
+<h2>$constraints</h2><div class="section-line"></div>
+<p>Defines inter-parameter relationships that the optimiser must respect during fitting. Each line is one constraint. The section is silently ignored during simulation — it only takes effect when the <strong>Activate constraints</strong> toggle is switched on in the sidebar.</p>
+
+<div class="callout">
+  <span class="callout-title">Opt-in at fit time</span>
+  <p>Constraints are <strong>never active by default</strong>. The <strong>Activate constraints</strong> checkbox appears in the sidebar only when a <code>$constraints</code> section is present in the script. It is unchecked on every script load. This lets you compare constrained and unconstrained fits without editing the script.</p>
+</div>
+
+<p>All modes support constraints: concentration, NMR (shift, integration, mixed), UV-Vis spectra, and kinetics (all variants). One constraint line can constrain any parameters defined in <code>$reactions</code> — equilibrium constants, forward rate constants, and reverse rate constants may all appear in the same constraint.</p>
+
+<h3 id="constraints-logspace">Log-space syntax (default)</h3>
+<p>When the expression contains only multiplication, division, or isolated parameter names — no addition or subtraction between parameters — Equinix evaluates everything in log space. Bare parameter names stand for their log₁₀ value, so arithmetic operators carry their natural log-space meaning:</p>
+
+<table class="kw-table">
+  <thead><tr><th>Written as</th><th>Mathematical meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>K1 = K2</code></td><td>K1 = K2</td></tr>
+    <tr><td><code>K1 / K2 = 1e3</code></td><td>K1 / K2 = 1000</td></tr>
+    <tr><td><code>K1 * K2 = 1e8</code></td><td>K1 · K2 = 10⁸</td></tr>
+    <tr><td><code>K1 * K2 / K3 = 1e5</code></td><td>K1 · K2 / K3 = 10⁵</td></tr>
+    <tr><td><code>K1 / (K2 * K3) = 100</code></td><td>K1 / (K2 · K3) = 100</td></tr>
+    <tr><td><code>2 * K1 = K2</code></td><td>2 · K1 = K2  (linear factor)</td></tr>
+    <tr><td><code>2 * log K1 = log K2</code></td><td>K2 = K1²  (log-space coefficient)</td></tr>
+    <tr><td><code>k1 / k-1 = 1e4</code></td><td>k1 / k−1 = 10⁴  (hyphenated rate constant name)</td></tr>
+    <tr><td><code>log K1 - log K2 = 3</code></td><td>K1 / K2 = 1000  (explicit log form)</td></tr>
+    <tr><td><code>K1 > 1e5</code></td><td>K1 &gt; 10⁵</td></tr>
+    <tr><td><code>K1 < K2</code></td><td>K1 &lt; K2</td></tr>
+    <tr><td><code>1e3 &lt; K1 / K2 &lt; 1e6</code></td><td>1000 &lt; K1/K2 &lt; 10⁶  (chained, generates two constraints)</td></tr>
+    <tr><td><code>K1 = K2 = K3</code></td><td>K1 = K2 and K2 = K3  (chained equality, generates two constraints)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <span class="callout-title">2 * K1 vs 2 * log K1</span>
+  <p>The prefix <code>2 *</code> on a bare name is a <strong>linear multiplier</strong>: <code>2 * K1 = K2</code> means K2 = 2·K1. To express a power-law relationship (K2 = K1²), use explicit log notation: <code>2 * log K1 = log K2</code>. The <code>log</code> keyword forces the coefficient to apply directly to the log value.</p>
+</div>
+
+<p>Parentheses are fully supported and nest arbitrarily: <code>K1 / (K2 * K3)</code>, <code>(K1 * K2) / K3</code>. Parameter names containing hyphens (e.g. reverse rate constants written as <code>k-1</code>) are recognised correctly and never confused with a subtraction operator.</p>
+
+<p><strong>Chaining</strong> works for any operator and any number of terms. Each consecutive pair generates one constraint, so <code>K1 = K2 = K3</code> produces K1 = K2 and K2 = K3 (which together enforce all three equal). Mixed chains are also valid: <code>1e3 &lt; K1 = K2 &lt; 1e6</code> generates three constraints — K1 &gt; 10³, K1 = K2, and K2 &lt; 10⁶. The <code>; hard</code> modifier applies to every constraint on the line.</p>
+
+<pre><code><span class="sec">$constraints</span>
+<span class="cmt"># Thermodynamic cycle: K3 must equal K1 * K2</span>
+<span class="sp">K3</span> <span class="op">=</span> <span class="sp">K1</span> <span class="op">*</span> <span class="sp">K2</span>
+
+<span class="cmt"># Microscopic reversibility: on-rate / off-rate = equilibrium constant</span>
+<span class="sp">k1</span> <span class="op">/</span> <span class="sp">k-1</span> <span class="op">=</span> <span class="val">1e4</span>
+
+<span class="cmt"># Ratio of binding constants within a factor of 10</span>
+<span class="val">1e-1</span> <span class="op">&lt;</span> <span class="sp">K1</span> <span class="op">/</span> <span class="sp">K2</span> <span class="op">&lt;</span> <span class="val">1e1</span>
+
+<span class="cmt"># K2 must be at least 100× smaller than K1</span>
+<span class="sp">K1</span> <span class="op">/</span> <span class="sp">K2</span> <span class="op">&gt;</span> <span class="val">100</span></code></pre>
+
+<h3 id="constraints-kspace">K-space syntax</h3>
+<p>When a <code>+</code> or <code>−</code> operator appears directly between two parameter names, Equinix switches to K-space evaluation: parameters are substituted as their actual K values (10<sup>logK</sup>), and the expression is evaluated numerically. This is for direct linear arithmetic on K values.</p>
+
+<pre><code><span class="sec">$constraints</span>
+<span class="cmt"># Sum of two rate constants equals a known total</span>
+<span class="sp">k1</span> <span class="op">+</span> <span class="sp">k2</span> <span class="op">=</span> <span class="val">1e7</span>
+
+<span class="cmt"># Weighted sum</span>
+<span class="val">2</span> <span class="op">*</span> <span class="sp">K1</span> <span class="op">+</span> <span class="sp">K2</span> <span class="op">=</span> <span class="val">3e6</span></code></pre>
+
+<h3 id="constraints-hard">Hard vs soft enforcement</h3>
+<p>By default all constraints are <strong>soft</strong>: violations are added to the objective function as a quadratic penalty. The optimiser is strongly discouraged from violating the constraint but is not absolutely prevented — this keeps the solver landscape smooth and avoids numerical failures near boundaries.</p>
+
+<p>Appending <code>; hard</code> to a line increases the penalty weight by a factor of 10⁶, making violation effectively impossible in practice.</p>
+
+<table class="kw-table">
+  <thead><tr><th>Type</th><th>Inequality penalty weight</th><th>Equality penalty weight</th></tr></thead>
+  <tbody>
+    <tr><td>Soft (default)</td><td>10⁶ × (violation)²</td><td>10⁸ × (violation)²</td></tr>
+    <tr><td>Hard (<code>; hard</code>)</td><td>10¹² × (violation)²</td><td>10¹⁴ × (violation)²</td></tr>
+  </tbody>
+</table>
+
+<p>The violation is measured in log₁₀ units for log-space constraints and in K units for K-space constraints.</p>
+
+<pre><code><span class="sec">$constraints</span>
+<span class="sp">K1</span> <span class="op">=</span> <span class="sp">K2</span>              <span class="cmt"># soft equality</span>
+<span class="sp">K1</span> <span class="op">&gt;</span> <span class="val">1e3</span>; <span class="kw">hard</span>      <span class="cmt"># hard lower bound</span></code></pre>
+
+<h3 id="constraints-ui">Using the Activate constraints toggle</h3>
+<p>When a <code>$constraints</code> section is present, an <strong>Activate constraints</strong> checkbox appears at the bottom of the sidebar parameter list. The tooltip shows how many constraints are defined. The checkbox is unchecked by default on every script load.</p>
+<ul>
+  <li><strong>Unchecked:</strong> fitting proceeds freely with no inter-parameter relationships enforced.</li>
+  <li><strong>Checked:</strong> all constraints in the section are applied as penalties during the fit.</li>
+</ul>
+
+<div class="callout warn">
+  <span class="callout-title">Starting point reset</span>
+  <p>When you uncheck <strong>Activate constraints</strong> after a constrained fit, Equinix automatically resets the starting parameter values to the script defaults before the next fit. This prevents the unconstrained optimiser from starting at the constrained optimum — which may lie in a narrow valley — and failing to find the true global minimum.</p>
+</div>
+
+<p>Parameter errors reported after a constrained fit are computed from the data residuals only (the constraint penalty is excluded from the Hessian). This ensures that the reported uncertainties reflect genuine information content in the data at the constrained optimum, and are not artificially compressed by the penalty curvature.</p>
+
 </section>
 
 <!-- ═══════════════════════════════════════ DATA CONCENTRATION ═══════════════════════════════════════ -->
@@ -1058,6 +1165,65 @@ y    = G, H, GH, GH2
 <span class="sec">$nmr</span>
 integration: <span class="val">3</span>, <span class="val">3</span>   <span class="cmt"># columns B–C: slow-exchange integrals (3H each)</span>
 shift: Gtot          <span class="cmt"># columns D–E: two fast-exchange shift signals</span></code></pre>
+</section>
+
+<!-- ═══════════════════════════════════════ EXAMPLE: CONSTRAINTS ═══════════════════════════════════════ -->
+<section id="ex-constraints">
+<h2>Example: Constraints</h2><div class="section-line"></div>
+<p>Two illustrative uses of <code>$constraints</code>: a thermodynamic cycle closure in an equilibrium system, and microscopic reversibility in a kinetics system.</p>
+
+<h3>Equilibrium: thermodynamic cycle</h3>
+<p>Three reactions form a closed thermodynamic cycle. The consistency requirement K3 = K1 · K2 is imposed as a soft constraint. Fitting K1 and K2 while K3 is constrained via the cycle avoids unphysical solutions.</p>
+<pre><code><span class="sec">$concentrations</span>
+<span class="sp">A0</span> = <span class="val">1.0</span> mM
+<span class="sp">B0</span> = <span class="val">1.0</span> mM
+
+<span class="sec">$volumes</span>
+<span class="sp">V0</span> = <span class="val">500</span> uL
+
+<span class="sec">$titrant</span>
+<span class="sp">Bt</span> = <span class="val">10.0</span> mM
+
+<span class="sec">$reactions</span>
+<span class="sp">A</span>     + <span class="sp">B</span>  = <span class="sp">AB</span>;  <span class="kw">log</span> <span class="sp">K1</span> = <span class="val">5.0</span>
+<span class="sp">AB</span>    + <span class="sp">B</span>  = <span class="sp">AB2</span>; <span class="kw">log</span> <span class="sp">K2</span> = <span class="val">4.0</span>
+<span class="sp">A</span>  + <span class="val">2</span> <span class="sp">B</span>  = <span class="sp">AB2</span>; <span class="kw">log</span> <span class="sp">K3</span> = <span class="val">9.0</span>   <span class="cmt"># must equal K1 * K2</span>
+
+<span class="sec">$constraints</span>
+<span class="sp">K3</span> <span class="op">=</span> <span class="sp">K1</span> <span class="op">*</span> <span class="sp">K2</span>   <span class="cmt"># thermodynamic cycle: K3 = K1 · K2</span>
+
+<span class="sec">$plot</span>
+xmax = <span class="val">3.00</span>
+y    = A, B, AB, AB2</code></pre>
+
+<h3>Kinetics: microscopic reversibility</h3>
+<p>For a reversible bimolecular step, the ratio of the forward and reverse rate constants is the equilibrium constant. The constraint enforces k1 / k−1 = 10⁴ (K<sub>d</sub> = 100 μM), linking two independently fitted parameters through a known thermodynamic quantity. This is the script from Tutorial 16B.</p>
+<pre><code><span class="sec">$concentrations</span>
+<span class="sp">A0</span> = <span class="val">50</span> uM
+<span class="sp">B0</span> = <span class="val">30</span> uM
+
+<span class="sec">$volumes</span>
+<span class="sp">V0</span> = <span class="val">0.5</span> mL
+
+<span class="sec">$reactions</span>
+<span class="sp">A</span> + <span class="sp">B</span> &lt;&gt; <span class="sp">C</span>; <span class="sp">k1</span>  = <span class="val">2e4</span>; <span class="sp">k-1</span> = <span class="val">2.0</span>
+<span class="sp">C</span>       &gt;  <span class="sp">D</span>; <span class="sp">k2</span>  = <span class="val">1.5</span>
+
+<span class="sec">$constraints</span>
+<span class="sp">k1</span> <span class="op">/</span> <span class="sp">k2</span> <span class="op">=</span> <span class="val">2e4</span>   <span class="cmt"># k1 / k2 = 20000: links on-rate to downstream step</span>
+
+<span class="sec">$plot</span>
+xmax = <span class="val">3.00</span>
+y    = A, B, C, D
+
+<span class="sec">$spectra</span>
+transparent: B</code></pre>
+
+<div class="callout">
+  <span class="callout-title">How to use these examples</span>
+  <p>Upload the script, load experimental data, check the parameters to fit. The <strong>Activate constraints</strong> checkbox will appear at the bottom of the parameter list. Run once unconstrained to see the free fit, then check the box and re-run to enforce the relationship. To return to unconstrained fitting, simply uncheck the box — Equinix resets the starting point automatically to the script defaults.</p>
+</div>
+
 </section>
 
 </main>
