@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 from equinix_network import solve_equilibria_general
 from equinix_fit_nmr import _hessian_errors
 from equinix_curve import convert_exp_x
+from equinix_parser import constraints_penalty
 
 __all__ = ['_compute_at_volumes', '_optimal_spectral_range', '_identifiability_check', 'fit_spectra']
 
@@ -227,7 +228,8 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
                 params: dict, logK_vals: dict, fit_keys: list,
                 x_expr: str, wl_min: float, wl_max: float,
                 tolerance: float, maxiter: int,
-                auto_range: bool = False, timeout_s: float = 30.0):
+                auto_range: bool = False, timeout_s: float = 30.0,
+                constraints=None):
     """
     Fit equilibrium constants to UV-Vis absorbance data using Beer-Lambert law.
 
@@ -391,6 +393,9 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
                     penalty += 1e6 * (kv - lo) ** 2
                 elif kv > hi:
                     penalty += 1e6 * (kv - hi) ** 2
+            lk_dict = {fit_keys[i]: logk_trial[i] for i in range(len(fit_keys))}
+            cp = constraints_penalty(constraints or [], {**logK_vals, **lk_dict})
+            penalty += cp
             if penalty > 0:
                 # Still update best if inside previously seen range
                 if penalty < best_tracker["f"]:
@@ -420,6 +425,8 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
         def objective_safe(logk_trial):
             penalty = sum(1e6*(kv-lo)**2 for kv,lo in zip(logk_trial,_k_lo) if kv < lo) + \
                       sum(1e6*(kv-hi)**2 for kv,hi in zip(logk_trial,_k_hi) if kv > hi)
+            lk_dict = {fit_keys[i]: logk_trial[i] for i in range(len(fit_keys))}
+            penalty += constraints_penalty(constraints or [], {**logK_vals, **lk_dict})
             if penalty > 0:
                 return penalty
             lk = _build_lnK(logk_trial)

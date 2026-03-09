@@ -7,6 +7,7 @@ from equinix_fit_spectra import _optimal_spectral_range
 from equinix_fit_nmr import _get_species_for_target, _hessian_errors, _resolve_c
 from equinix_kinetics_nmr import _kinetics_nmr_integration_backCalc
 from equinix_curve import convert_exp_x
+from equinix_parser import constraints_penalty
 
 __all__ = ['fit_kinetics_spectra']
 
@@ -16,7 +17,8 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
                          wl_min: float, wl_max: float,
                          tolerance: float, maxiter: int,
                          timeout_s: float = 30.0, auto_range: bool = False,
-                         use_lbfgsb: bool = True, use_neldermead: bool = True):
+                         use_lbfgsb: bool = True, use_neldermead: bool = True,
+                         constraints=None):
     """
     Fit rate constants to UV-Vis kinetics spectra using Beer-Lambert law.
 
@@ -64,6 +66,21 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
         return np.maximum(C, 0.0)
 
     def objective(logk_trial):
+        lk = logk_dict.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
+        curve = _simulate(logk_trial)
+        if curve is None:
+            return 1e12
+        C = _build_C(curve)
+        E, _, _, _ = np.linalg.lstsq(C, A_fit, rcond=None)
+        return float(np.sum((A_fit - C @ E) ** 2))
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
         curve = _simulate(logk_trial)
         if curve is None:
             return 1e12
@@ -88,6 +105,10 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
     def objective_safe(logk_trial):
         penalty = sum(1e6*(v-lo)**2 for v,lo in zip(logk_trial,_k_lo) if v < lo) + \
                   sum(1e6*(v-hi)**2 for v,hi in zip(logk_trial,_k_hi) if v > hi)
+        lk = logk_dict.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        penalty += constraints_penalty(constraints or [], lk)
         if penalty > 0:
             return float(penalty)
         return objective(logk_trial)
@@ -195,7 +216,7 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
     r2_conc   = float(1.0 - np.sum(_c_res ** 2) / max(_c_sst, 1e-30))
     rmse_conc = float(np.sqrt(np.sum(_c_res ** 2) / max(len(_c_res), 1)))
 
-    _err_idx     = _hessian_errors(objective, result.x, ssr, len(residuals), n_p)
+    _err_idx     = _hessian_errors(data_objective, result.x, ssr, len(residuals), n_p)
     param_errors = {fit_keys[i]: _err_idx[i] for i in range(n_p) if i in _err_idx}
 
     _r2_ok = r2 >= 0.99

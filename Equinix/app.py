@@ -161,6 +161,15 @@ def _k_input_with_fit(label, key, default_log):
 for _pk in [k for k in st.session_state if k.startswith("_pending_logK_")]:
     _real = _pk[len("_pending_"):]   # "_pending_logK_Kdimer" → "logK_Kdimer"
     st.session_state[_real] = st.session_state.pop(_pk)
+    st.session_state.pop(f"_lin_{_real}", None)  # clear stale linear display cache
+
+# ── Restore fit-checkbox states persisted across kinetics fit rerun ──────
+# In kinetics mode the fit block runs BEFORE the sidebar, so Streamlit
+# garbage-collects fit_logK_* keys (never rendered in the fit run).
+# We snapshot them just before st.rerun() and restore them here.
+for _pk in [k for k in st.session_state if k.startswith("_persist_fit_logK_")]:
+    _fk = _pk[len("_persist_"):]   # "_persist_fit_logK_k1" → "fit_logK_k1"
+    st.session_state[_fk] = st.session_state.pop(_pk)
 
 # ── Script upload ─────────────────────────────
 with st.sidebar:
@@ -201,7 +210,7 @@ with st.sidebar:
 script_text = st.session_state.get("_script_text", None)
 
 if script_text is None:
-    st.info("Upload a network script (.txt) in the sidebar to begin.")
+    st.info("Upload a script (.txt) in the sidebar to begin.")
     st.stop()
 
 # ── Parse & validate ──────────────────────────
@@ -284,6 +293,25 @@ if IS_KINETICS:
                                st.session_state.get("fit_timeout", 30)))
             maxiter    = 100_000
             try:
+                # Constraints are only passed if the toggle is active
+                _this_fit_constrained = st.session_state.get("fit_use_constraints", False)
+                _last_fit_constrained = st.session_state.get("_last_fit_was_constrained", False)
+                _active_constraints = (
+                    parsed_fit.get("constraints", []) if _this_fit_constrained else []
+                )
+
+                # If constraints were just turned OFF, reset starting logK to script
+                # defaults so the optimizer isn't trapped near the constrained optimum.
+                if _last_fit_constrained and not _this_fit_constrained:
+                    _script_defaults = {**{e["kname"]: e["logK"]   for e in parsed_fit["equilibria"]},
+                                        **{r["kname"]: r["log_k"]  for r in parsed_fit.get("kinetics", [])},
+                                        **{r["krname"]: r["log_kr"] for r in parsed_fit.get("kinetics", []) if "krname" in r}}
+                    _start_logk = {k: _script_defaults.get(k, v) for k, v in current_logk.items()}
+                else:
+                    _start_logk = current_logk
+
+                st.session_state["_last_fit_was_constrained"] = _this_fit_constrained
+
                 if _use_spectra_fit:
                     wl_min_k = float(st.session_state.get("spectra_wl_min",
                                      _spectra_data_fit["wavelengths"][0]))
@@ -291,30 +319,35 @@ if IS_KINETICS:
                                      _spectra_data_fit["wavelengths"][-1]))
                     _auto_range_k = bool(st.session_state.get("spectra_auto_range", False))
                     success, fitted, stats, msg = fit_kinetics_spectra(
-                        parsed_fit, current_logk, _spectra_data_fit, fit_keys_k,
+                        parsed_fit, _start_logk, _spectra_data_fit, fit_keys_k,
                         t_max, 200, wl_min_k, wl_max_k, tol, maxiter,
                         timeout_s=_timeout_s, auto_range=_auto_range_k,
                         use_lbfgsb=st.session_state.get("fit_use_lbfgsb", True),
-                        use_neldermead=st.session_state.get("fit_use_neldermead", True))
+                        use_neldermead=st.session_state.get("fit_use_neldermead", True),
+                        constraints=_active_constraints)
                     if _auto_range_k and "opt_wl_min" in stats:
                         st.session_state["_pending_spectra_wl_min"] = stats["opt_wl_min"]
                         st.session_state["_pending_spectra_wl_max"] = stats["opt_wl_max"]
                 elif _use_nmr_fit and _nmr_cfg_fit["mode"] == "shift":
                     success, fitted, stats, msg = fit_kinetics_nmr_shifts(
-                        parsed_fit, current_logk, _nmr_data_fit, fit_keys_k,
-                        t_max, 200, tol, maxiter, timeout_s=_timeout_s)
+                        parsed_fit, _start_logk, _nmr_data_fit, fit_keys_k,
+                        t_max, 200, tol, maxiter, timeout_s=_timeout_s,
+                        constraints=_active_constraints)
                 elif _use_nmr_fit and _nmr_cfg_fit["mode"] == "integration":
                     success, fitted, stats, msg = fit_kinetics_nmr_integration(
-                        parsed_fit, current_logk, _nmr_data_fit, fit_keys_k,
-                        t_max, 200, tol, maxiter, timeout_s=_timeout_s)
+                        parsed_fit, _start_logk, _nmr_data_fit, fit_keys_k,
+                        t_max, 200, tol, maxiter, timeout_s=_timeout_s,
+                        constraints=_active_constraints)
                 elif _use_nmr_fit and _nmr_cfg_fit["mode"] == "mixed":
                     success, fitted, stats, msg = fit_kinetics_nmr_mixed(
-                        parsed_fit, current_logk, _nmr_data_fit, fit_keys_k,
-                        t_max, 200, tol, maxiter, timeout_s=_timeout_s)
+                        parsed_fit, _start_logk, _nmr_data_fit, fit_keys_k,
+                        t_max, 200, tol, maxiter, timeout_s=_timeout_s,
+                        constraints=_active_constraints)
                 else:
                     success, fitted, stats, msg = fit_kinetics(
-                        parsed_fit, exp_data_fit, current_logk, fit_keys_k,
-                        t_max, 200, tol, maxiter, timeout_s=_timeout_s)
+                        parsed_fit, exp_data_fit, _start_logk, fit_keys_k,
+                        t_max, 200, tol, maxiter, timeout_s=_timeout_s,
+                        constraints=_active_constraints)
                 for name, val in fitted.items():
                     st.session_state[f"_pending_logK_{name}"] = float(val)
                 st.session_state["_fit_stats"] = stats
@@ -334,6 +367,14 @@ if IS_KINETICS:
                 import traceback as _tb
                 st.session_state["_fit_message"] = ("warning",
                     f"Fitting error: {_fit_exc}\n{_tb.format_exc()}")
+            # ── Persist fit-checkbox states across rerun ──────────────────────
+            # The sidebar (which renders fit_logK_* widgets) runs AFTER this
+            # block, so Streamlit GC will remove unrendered fit_logK_* keys.
+            # Snapshot them now; the top-of-script loop restores them on Run B.
+            for _fname in list(logk_dict.keys()):
+                _fk = f"fit_logK_{_fname}"
+                if _fk in st.session_state:
+                    st.session_state[f"_persist_{_fk}"] = st.session_state[_fk]
             st.rerun()
 
     # ── Apply pending fitted values ──────────────────────────────
@@ -403,6 +444,15 @@ if IS_KINETICS:
 
         # Merge UI values into logk_dict
         logk_dict.update(logk_ui)
+
+        # ── Constraints toggle (only shown when $constraints section present) ──
+        if parsed.get("constraints"):
+            st.checkbox(
+                "Activate constraints",
+                key="fit_use_constraints",
+                value=False,
+                help=f"{len(parsed['constraints'])} constraint(s) defined in $constraints section.",
+            )
 
     # ── Simulate ─────────────────────────────────────────────────
     # Patch initial concentrations from sidebar into parsed copy
@@ -1180,6 +1230,16 @@ with st.sidebar:
         label = f"{kname}  ({' + '.join(reactants_str)} ⇌ {products_str})"
         logK_vals[kname] = _logk_input_with_fit(label, key=f"logK_{kname}", default=eq["logK"])
 
+# ── Constraints toggle (only shown when $constraints section present) ──
+if parsed.get("constraints"):
+    with st.sidebar:
+        st.checkbox(
+            "Activate constraints",
+            key="fit_use_constraints",
+            value=False,
+            help=f"{len(parsed['constraints'])} constraint(s) defined in $constraints section.",
+        )
+
 # ── Thermodynamic cycle detection ────────────
 cycle_warnings = detect_thermodynamic_cycles(parsed, logK_vals)
 for w in cycle_warnings:
@@ -1299,6 +1359,23 @@ if st.session_state.pop("_fit_requested", False):
             if not _use_lbfgsb and not _use_neldermead:
                 _use_lbfgsb = True
 
+            # Constraints are only passed if the toggle is active
+            _this_fit_constrained = st.session_state.get("fit_use_constraints", False)
+            _last_fit_constrained = st.session_state.get("_last_fit_was_constrained", False)
+            _active_constraints = (
+                parsed.get("constraints", []) if _this_fit_constrained else []
+            )
+
+            # If constraints were just turned OFF, reset starting logK to script
+            # defaults so the optimizer isn't trapped near the constrained optimum.
+            if _last_fit_constrained and not _this_fit_constrained:
+                _script_defaults = {eq["kname"]: eq["logK"] for eq in parsed["equilibria"]}
+                _start_logK = {k: _script_defaults.get(k, v) for k, v in logK_vals.items()}
+            else:
+                _start_logK = logK_vals
+
+            st.session_state["_last_fit_was_constrained"] = _this_fit_constrained
+
             if use_spectra_fit:
                 wl_min_fit = float(st.session_state.get("spectra_wl_min",
                                    spectra_data_fit["wavelengths"][0]))
@@ -1308,9 +1385,10 @@ if st.session_state.pop("_fit_requested", False):
                 _timeout_s = float(st.session_state.get("fit_timeout", 30))
                 with st.spinner("Fitting UV-Vis spectra…"):
                     success, fitted_logKs, stats, message = fit_spectra(
-                        parsed, network, spectra_data_fit, params, logK_vals,
+                        parsed, network, spectra_data_fit, params, _start_logK,
                         fit_keys_end, x_expr, wl_min_fit, wl_max_fit,
-                        tolerance, maxiter, auto_range=auto_range, timeout_s=_timeout_s)
+                        tolerance, maxiter, auto_range=auto_range, timeout_s=_timeout_s,
+                        constraints=_active_constraints)
                 if auto_range and "opt_wl_min" in stats:
                     st.session_state["_pending_spectra_wl_min"] = stats["opt_wl_min"]
                     st.session_state["_pending_spectra_wl_max"] = stats["opt_wl_max"]
@@ -1318,29 +1396,33 @@ if st.session_state.pop("_fit_requested", False):
                 _timeout_s = float(st.session_state.get("fit_timeout", 30))
                 with st.spinner("Fitting NMR chemical shifts…"):
                     success, fitted_logKs, stats, message = fit_nmr_shifts(
-                        parsed, network, nmr_data_fit, params, logK_vals,
+                        parsed, network, nmr_data_fit, params, _start_logK,
                         fit_keys_end, x_expr, tolerance, maxiter,
-                        timeout_s=_timeout_s)
+                        timeout_s=_timeout_s,
+                        constraints=_active_constraints)
             elif use_nmr_fit and nmr_cfg_fit["mode"] == "integration":
                 _timeout_s = float(st.session_state.get("fit_timeout", 30))
                 with st.spinner("Fitting NMR integrations…"):
                     success, fitted_logKs, stats, message = fit_nmr_integration(
-                        parsed, network, nmr_data_fit, params, logK_vals,
+                        parsed, network, nmr_data_fit, params, _start_logK,
                         fit_keys_end, x_expr, tolerance, maxiter,
-                        timeout_s=_timeout_s)
+                        timeout_s=_timeout_s,
+                        constraints=_active_constraints)
             elif use_nmr_fit and nmr_cfg_fit["mode"] == "mixed":
                 _timeout_s = float(st.session_state.get("fit_timeout", 30))
                 with st.spinner("Fitting mixed slow+fast exchange NMR…"):
                     success, fitted_logKs, stats, message = fit_nmr_mixed(
-                        parsed, network, nmr_data_fit, params, logK_vals,
+                        parsed, network, nmr_data_fit, params, _start_logK,
                         fit_keys_end, x_expr, tolerance, maxiter,
-                        timeout_s=_timeout_s)
+                        timeout_s=_timeout_s,
+                        constraints=_active_constraints)
             else:
                 with st.spinner("Fitting parameters..."):
                     success, fitted_logKs, stats, message = fit_parameters(
-                        parsed, network, exp_data_fit, params, logK_vals,
+                        parsed, network, exp_data_fit, params, _start_logK,
                         fit_keys_end, x_expr, tolerance, maxiter,
-                        use_lbfgsb=_use_lbfgsb, use_neldermead=_use_neldermead)
+                        use_lbfgsb=_use_lbfgsb, use_neldermead=_use_neldermead,
+                        constraints=_active_constraints)
 
             for kname, fitted_val in fitted_logKs.items():
                 st.session_state[f"_pending_logK_{kname}"] = float(fitted_val)

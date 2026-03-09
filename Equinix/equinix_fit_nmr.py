@@ -6,6 +6,7 @@ from scipy.optimize import minimize
 from equinix_network import compute_variable_curve, _sanitise_pct
 from equinix_curve import convert_exp_x, find_equiv_for_x, compute_single_point
 from equinix_curve import compute_curve, evaluate_x_expression
+from equinix_parser import constraints_penalty
 
 __all__ = ['compute_nmr_curves', '_get_species_for_target', '_hessian_errors', 'fit_nmr_shifts', '_resolve_c', '_nmr_integration_backCalc', 'fit_nmr_integration', 'fit_nmr_mixed']
 
@@ -163,7 +164,7 @@ def _hessian_errors(objective_fn, x_best: np.ndarray, ssr_best: float,
 def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
                    params: dict, logK_vals: dict, fit_keys: list,
                    x_expr: str, tolerance: float, maxiter: int,
-                   timeout_s: float = 30.0):
+                   timeout_s: float = 30.0, constraints=None):
     """
     Fit equilibrium constants + per-signal pure-species shifts to NMR data.
 
@@ -268,6 +269,29 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
         return dd, calc, float(np.sum((delta_obs_rel - calc)**2))
 
     def objective(logk_trial):
+        lk = logK_vals.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
+        c = _simulate(logk_trial)
+        if c is None: return 1e12
+        total_ssr = 0.0
+        for col, col_data in nmr_data.items():
+            if col.startswith("_"): continue
+            tgt       = col_to_target.get(col, nmr_cfg["targets"][0])
+            sp_coeffs = _get_species_for_target(tgt, parsed, network)
+            if not sp_coeffs: continue
+            x_exp         = _x_for_col(col_data)
+            delta_obs_rel = col_data["y"] - delta_free[col]
+            X = _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=x_free_val[col])
+            _, _, ssr = _analytic_delta(X, delta_obs_rel)
+            total_ssr += ssr
+        return total_ssr
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
         c = _simulate(logk_trial)
         if c is None: return 1e12
         total_ssr = 0.0
@@ -379,8 +403,8 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / max(len(residuals), 1)))
 
-    # Parameter errors via finite-difference Hessian
-    _err_idx = _hessian_errors(objective, result.x, ssr, len(residuals), len(fit_keys))
+    # Parameter errors via finite-difference Hessian (data-only objective, never penalised)
+    _err_idx = _hessian_errors(data_objective, result.x, ssr, len(residuals), len(fit_keys))
     param_errors_shift = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
 
     stats = {
@@ -589,7 +613,7 @@ def _nmr_integration_backCalc(nmr_data: dict, n_H_list: list, params: dict,
 def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
                         params: dict, logK_vals: dict, fit_keys: list,
                         x_expr: str, tolerance: float, maxiter: int,
-                        timeout_s: float = 30.0):
+                        timeout_s: float = 30.0, constraints=None):
     """
     Fit equilibrium constants to slow-exchange NMR integration data.
 
@@ -643,6 +667,23 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
             return None
 
     def objective(logk_trial):
+        lk = logK_vals.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
+        c = _simulate(logk_trial)
+        if c is None: return 1e12
+        x_sim, _ = evaluate_x_expression(x_expr, c, parsed)
+        ssr = 0.0
+        for sp, (x_bc, c_bc) in bc.items():
+            c_th = np.interp(x_bc, x_sim, _resolve_c(c, sp, parsed, x_sim))
+            ssr += float(np.sum((c_bc - c_th) ** 2))
+        return ssr
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
         c = _simulate(logk_trial)
         if c is None: return 1e12
         x_sim, _ = evaluate_x_expression(x_expr, c, parsed)
@@ -700,8 +741,8 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / max(len(residuals), 1)))
 
-    # Parameter errors via finite-difference Hessian
-    _err_idx = _hessian_errors(objective, result.x, ssr, len(residuals), len(fit_keys))
+    # Parameter errors via finite-difference Hessian (data-only objective, never penalised)
+    _err_idx = _hessian_errors(data_objective, result.x, ssr, len(residuals), len(fit_keys))
     param_errors_integ = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
 
     # sp_concs format: {sp: [(x_arr, c_bc_arr), ...]}  (list for compatibility)
@@ -741,7 +782,7 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
 def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
                   params: dict, logK_vals: dict, fit_keys: list,
                   x_expr: str, tolerance: float, maxiter: int,
-                  timeout_s: float = 30.0):
+                  timeout_s: float = 30.0, constraints=None):
     """
     Fit equilibrium constants to mixed slow+fast exchange NMR data.
 
@@ -857,6 +898,12 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
         return total
 
     def objective(logk_trial):
+        lk = logK_vals.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
         c = _simulate(logk_trial)
         if c is None: return 1e12
         x_sim, _ = evaluate_x_expression(x_expr, c, parsed)
@@ -876,6 +923,21 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
         shift_ssr = shift_ssr_raw / shift_var
 
         return integ_ssr + shift_ssr
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
+        c = _simulate(logk_trial)
+        if c is None: return 1e12
+        x_sim, _ = evaluate_x_expression(x_expr, c, parsed)
+        integ_ssr = 0.0
+        integ_var = max(sum(float(np.var(c_bc)) for _, (_, c_bc) in bc.items()), 1e-20)
+        for sp, (x_bc, c_bc) in bc.items():
+            c_th = np.interp(x_bc, x_sim, _resolve_c(c, sp, parsed, x_sim))
+            integ_ssr += float(np.sum((c_bc - c_th)**2)) / integ_var
+        shift_ssr_raw = _shift_ssr(c)
+        shift_var = max(sum(float(np.var(nmr_data[col2]["y"]))
+                            for col2 in shift_cols), 1e-20) if shift_cols else 1.0
+        return integ_ssr + shift_ssr_raw / shift_var
 
     import time
 
@@ -1025,8 +1087,9 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
     # Parameter errors via finite-difference Hessian of the normalized objective.
     # For mixed mode the objective is dimensionless (normalized chi-squared), so
     # σ² is just 1/(n-p) — we're already working in units of variance.
-    ssr_obj = float(objective(result.x))   # normalized objective at minimum
-    _err_idx = _hessian_errors(objective, result.x, ssr_obj, n_total, len(fit_keys))
+    # Use data_objective (no penalty) so constraint curvature doesn't dominate.
+    ssr_obj = float(data_objective(result.x))   # normalized data-only objective at minimum
+    _err_idx = _hessian_errors(data_objective, result.x, ssr_obj, n_total, len(fit_keys))
     param_errors_mixed = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
 
     # Build col_to_sp and col_to_nH for display

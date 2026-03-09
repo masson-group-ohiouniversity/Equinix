@@ -123,6 +123,426 @@ def parse_species_with_stoich(species_str):
         return 1, species_str
 
 
+def _tokenize_expr(s, param_names):
+    """
+    Tokenize a constraint expression, matching parameter names first using
+    longest-match so that hyphenated names like 'k-1' are found before
+    the '-' is mistaken for a subtraction operator.
+
+    Token types: LOG, NAME, NUMBER, LPAREN, RPAREN, OP (one of + - * /), WS
+    Returns list of (type, value) pairs.
+    """
+    # Sort param names longest-first so 'k-1' beats 'k' at the same position
+    sorted_params = sorted(param_names, key=len, reverse=True)
+
+    tokens = []
+    i = 0
+    while i < len(s):
+        # Skip whitespace
+        if s[i].isspace():
+            i += 1
+            continue
+
+        # 'log' keyword (only if NOT the start of a param name)
+        if s[i:i+3].lower() == 'log' and not any(
+                s[i:].startswith(p) and len(p) > 3 for p in sorted_params):
+            # Make sure it's not part of a longer param name
+            rest = s[i+3:]
+            if not rest or not (rest[0].isalnum() or rest[0] == '_' or rest[0] == '-'):
+                tokens.append(('LOG', 'log'))
+                i += 3
+                continue
+
+        # Parameter names (longest-match)
+        matched_param = None
+        for p in sorted_params:
+            if s[i:i+len(p)] == p:
+                # Make sure it's not a prefix of a longer identifier
+                end = i + len(p)
+                after = s[end] if end < len(s) else ''
+                if not (after.isalnum() or after == '_'):
+                    matched_param = p
+                    break
+        if matched_param is not None:
+            tokens.append(('NAME', matched_param))
+            i += len(matched_param)
+            continue
+
+        # Number (no leading sign — sign handled as OP)
+        m = re.match(r'(\d+\.?\d*|\.\d+)([eE][+\-]?\d+)?', s[i:])
+        if m:
+            tokens.append(('NUMBER', float(m.group(0))))
+            i += len(m.group(0))
+            continue
+
+        # Operators and parentheses
+        if s[i] == '(':
+            tokens.append(('LPAREN', '('))
+        elif s[i] == ')':
+            tokens.append(('RPAREN', ')'))
+        elif s[i] in '+-*/':
+            tokens.append(('OP', s[i]))
+        else:
+            raise ValueError(f"Unexpected character '{s[i]}' in constraint expression '{s}'")
+        i += 1
+
+    return tokens
+
+
+def _parse_constraint_expr(s, param_names, line_has_log):
+    """
+    Parse one side of a constraint as a linear expression in log K space.
+
+    Grammar (all operators have log-space semantics):
+        expr   := ['+' | '-'] term (( '+' | '-') term)*
+        term   := factor (('*' | '/') factor)*
+        factor := '(' expr ')' | 'log' NAME | NAME | NUMBER
+
+    Log-space semantics:
+      * and / between factors → add / subtract log-coefficients
+      + and - between terms   → add / subtract log-coefficients (already in log units)
+
+    line_has_log = True  → numbers are already in log units (const += n)
+    line_has_log = False → numbers are K-values, convert via log10 (const += log10(n))
+
+    Bare NAME (no 'log' prefix):
+      line_has_log = False → treated as log K (coefficient 1 on NAME)
+      line_has_log = True  → also treated as log K for backward-compat
+
+    Returns {"coeffs": {name: float}, "const": float} or raises ValueError.
+    """
+    import math as _math
+
+    param_set = set(param_names)
+    tokens = _tokenize_expr(s.strip(), param_names)
+
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else ('EOF', '')
+
+    def consume():
+        t = tokens[pos[0]]
+        pos[0] += 1
+        return t
+
+    def add_terms(a, b, sign=1.0):
+        """Combine two {coeffs, const} dicts: return a + sign*b."""
+        c = dict(a['coeffs'])
+        for k, v in b['coeffs'].items():
+            c[k] = c.get(k, 0.0) + sign * v
+        return {
+            'coeffs': {k: v for k, v in c.items() if abs(v) > 1e-15},
+            'const':  a['const'] + sign * b['const'],
+        }
+
+    def parse_expr():
+        # Optional leading sign
+        sign = 1.0
+        if peek() == ('OP', '-'):
+            consume(); sign = -1.0
+        elif peek() == ('OP', '+'):
+            consume()
+
+        result = parse_term()
+        if sign == -1.0:
+            result = {'coeffs': {k: -v for k, v in result['coeffs'].items()},
+                      'const':  -result['const']}
+
+        while peek()[0] == 'OP' and peek()[1] in ('+', '-'):
+            op = consume()[1]
+            rhs = parse_term()
+            s_op = 1.0 if op == '+' else -1.0
+            result = add_terms(result, rhs, s_op)
+
+        return result
+
+    def parse_term():
+        result = parse_factor()
+        while peek()[0] == 'OP' and peek()[1] in ('*', '/'):
+            op = consume()[1]
+            rhs = parse_factor()
+            if op == '*':
+                result = add_terms(result, rhs, 1.0)   # log(A*B) = logA + logB
+            else:
+                result = add_terms(result, rhs, -1.0)  # log(A/B) = logA - logB
+        return result
+
+    def parse_factor():
+        t = peek()
+
+        if t[0] == 'LPAREN':
+            consume()
+            result = parse_expr()
+            if peek()[0] != 'RPAREN':
+                raise ValueError("Missing closing parenthesis in constraint expression")
+            consume()
+            return result
+
+        if t[0] == 'LOG':
+            consume()
+            name_tok = peek()
+            if name_tok[0] != 'NAME':
+                raise ValueError(f"Expected parameter name after 'log', got '{name_tok[1]}'")
+            consume()
+            name = name_tok[1]
+            if name not in param_set:
+                raise ValueError(f"Unknown parameter '{name}' in constraint")
+            return {'coeffs': {name: 1.0}, 'const': 0.0}
+
+        if t[0] == 'NAME':
+            consume()
+            name = t[1]
+            if name not in param_set:
+                raise ValueError(f"Unknown parameter '{name}' in constraint")
+            return {'coeffs': {name: 1.0}, 'const': 0.0}
+
+        if t[0] == 'NUMBER':
+            consume()
+            n = t[1]
+            if line_has_log:
+                return {'coeffs': {}, 'const': n}
+            if n <= 0:
+                raise ValueError(f"Non-positive number {n} cannot be converted to log scale")
+            return {'coeffs': {}, 'const': _math.log10(n)}
+
+        raise ValueError(f"Unexpected token '{t[1]}' in constraint expression '{s}'")
+
+    result = parse_expr()
+    if peek()[0] != 'EOF':
+        raise ValueError(
+            f"Unexpected '{peek()[1]}' in constraint expression '{s}' — "
+            "use K-space syntax for direct arithmetic (e.g. K1 + K2 = 1e7)"
+        )
+    return result
+
+
+def _needs_kspace_eval(expr_str, param_names):
+    """
+    Returns True if expr_str should be evaluated in K-space (actual K values)
+    rather than log-space (linear in log K).
+
+    Rule: if any bare (non-log) parameter name appears in an expression that
+    also has a binary + or - operator, the user is doing K-space arithmetic.
+
+    Critical: parameter names that contain hyphens (e.g. 'k-1') are masked
+    out FIRST so their internal hyphen is never mistaken for a minus operator.
+
+    Examples that return True:
+        "K1 + K2"         -> K1 and K2 added directly
+        "2 * K1 + K2"     -> linear combination with addition
+
+    Examples that return False:
+        "K1"              -> single bare param -> log-space
+        "K1 * K2"         -> multiplicative -> log-space
+        "K1 / K2"         -> ratio -> log-space
+        "k1 / k-1"        -> ratio, 'k-1' is a param name, not k minus 1
+        "log K1 + log K2" -> explicit log -> log-space
+        "1e5"             -> pure number
+    """
+    if not param_names:
+        return False
+    # Mask out param names (longest first) to avoid confusing hyphens/symbols in names
+    cleaned = expr_str
+    for p in sorted(param_names, key=len, reverse=True):
+        cleaned = cleaned.replace(p, '__P__')
+    # Also mask out 'log NAME' tokens that are explicitly log-space
+    cleaned = re.sub(r'\blog\s+\w+', '__LOG__', cleaned, flags=re.I)
+    cleaned = re.sub(r'\blog\s+__P__', '__LOG__', cleaned, flags=re.I)
+    # Does the cleaned expression still contain any bare parameter placeholder?
+    if '__P__' not in cleaned:
+        return False
+    # Is there a binary + or - (i.e. not part of an exponent like 1e-5)?
+    return bool(re.search(r'(?<![eE])\s*[+-]\s*(?=[^\s])', cleaned[1:]))  # skip leading sign
+
+
+def _parse_constraint_line(line, param_names):
+    """
+    Parse one $constraints line into a list of constraint dicts.
+
+    Auto-detects whether each expression is log-space or K-space:
+    - Log-space (linear in log K): K1 > K2, K1 = 2*K2, K1 > 1e5, log K1 + log K2 < 15
+    - K-space (arithmetic in K):   K1 + K2 = 1e7, 2*K1 + K2 < 1e8
+
+    Supports '; hard' modifier for strict enforcement.
+    Supports chained comparisons: 3 < log K1 < 8
+
+    Log-space dict keys: "mode"="log", "coeffs", "const", "op", "hard"
+    K-space dict keys:   "mode"="K",   "lhs_expr", "rhs_expr", "op", "hard", "param_names"
+    """
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return []
+
+    # ── Strip '; hard' modifier ───────────────────────────────────────────
+    hard = False
+    if ';' in line:
+        main_part, flag_part = line.split(';', 1)
+        if flag_part.strip().lower() == 'hard':
+            hard = True
+        line = main_part.strip()
+
+    # ── Split on comparison operators ─────────────────────────────────────
+    OP_RE = re.compile(r'(<=|>=|<|>|=)')
+    parts = OP_RE.split(line)
+    if len(parts) < 3:
+        return []
+
+    exprs_raw = [parts[i].strip() for i in range(0, len(parts), 2)]
+    ops       = [parts[i].strip() for i in range(1, len(parts), 2)]
+
+    valid_ops = {'<', '>', '=', '<=', '>='}
+    if not all(o in valid_ops for o in ops):
+        return []
+    ops = ['<' if o == '<=' else '>' if o == '>=' else o for o in ops]
+
+    # ── Detect mode: K-space if any segment needs it ───────────────────────
+    if any(_needs_kspace_eval(e, param_names) for e in exprs_raw):
+        # K-space: store raw expressions for numeric evaluation at fit time
+        result = []
+        for i, op in enumerate(ops):
+            result.append({
+                "mode":        "K",
+                "lhs_expr":    exprs_raw[i],
+                "rhs_expr":    exprs_raw[i + 1],
+                "op":          op,
+                "hard":        hard,
+                "param_names": list(param_names),
+            })
+        return result
+
+    # ── Log-space: parse to linear coefficients ───────────────────────────
+    line_has_log = bool(re.search(r'\blog\s+\w', line, re.I))
+    parsed_exprs = []
+    for e in exprs_raw:
+        try:
+            parsed_exprs.append(_parse_constraint_expr(e, param_names, line_has_log))
+        except ValueError:
+            return []
+
+    result = []
+    for i, op in enumerate(ops):
+        lhs = parsed_exprs[i]
+        rhs = parsed_exprs[i + 1]
+        combined_coeffs = dict(lhs["coeffs"])
+        for name, coeff in rhs["coeffs"].items():
+            combined_coeffs[name] = combined_coeffs.get(name, 0.0) - coeff
+        combined_coeffs = {k: v for k, v in combined_coeffs.items() if abs(v) > 1e-15}
+        combined_const  = lhs["const"] - rhs["const"]
+        result.append({
+            "mode":   "log",
+            "coeffs": combined_coeffs,
+            "const":  combined_const,
+            "op":     op,
+            "hard":   hard,
+        })
+    return result
+
+
+def _eval_kspace_expr(expr_str, logK_dict, param_names):
+    """
+    Safely evaluate a K-space arithmetic expression.
+    Parameter names are mapped to their actual K values (10^logK).
+    Only arithmetic operations and standard math functions are permitted.
+
+    Handles param names containing hyphens (e.g. 'k-1') by replacing them
+    with safe Python identifiers before calling eval.
+
+    Returns float, or raises ValueError on failure.
+    """
+    import math as _math
+
+    # Build a safe-identifier mapping for any param name that isn't a valid
+    # Python identifier (e.g. 'k-1' → '_p0_', 'k_1' left as-is)
+    safe_map = {}   # original_name -> safe_identifier
+    for name in sorted(param_names, key=len, reverse=True):
+        if not name.isidentifier():
+            safe_id = f"_p{len(safe_map)}_"
+            safe_map[name] = safe_id
+
+    # Substitute in the expression string (longest names first)
+    expr_safe = expr_str
+    for orig, safe in safe_map.items():
+        expr_safe = expr_safe.replace(orig, safe)
+
+    # Build namespace: (possibly renamed) param -> 10^logK
+    ns = {}
+    for name in param_names:
+        val = 10 ** logK_dict.get(name, 0.0)
+        ns[safe_map.get(name, name)] = val
+    ns.update({
+        "log": _math.log10,
+        "ln":  _math.log,
+        "exp": _math.exp,
+        "sqrt": _math.sqrt,
+        "abs": abs,
+        "pi":  _math.pi,
+        "e":   _math.e,
+    })
+
+    try:
+        result = eval(compile(expr_safe, "<constraint>", "eval"),  # noqa: S307
+                      {"__builtins__": {}}, ns)
+        return float(result)
+    except Exception as exc:
+        raise ValueError(f"Cannot evaluate K-space expression '{expr_str}': {exc}") from exc
+
+
+def constraints_penalty(constraints, logK_dict):
+    """
+    Compute total penalty for all violated constraints.
+
+    Soft weights:  inequality 1e6,  equality 1e8
+    Hard weights:  inequality 1e12, equality 1e14
+
+    Log-space constraint f = Σ(aᵢ·logKᵢ) + c:
+        '<' penalty: W * max(0,  f)²
+        '>' penalty: W * max(0, -f)²
+        '=' penalty: W * f²
+
+    K-space constraint: evaluate lhs and rhs, penalty on (lhs - rhs).
+    """
+    if not constraints:
+        return 0.0
+
+    W_SOFT_INEQ = 1e6
+    W_SOFT_EQ   = 1e8
+    W_HARD_INEQ = 1e12
+    W_HARD_EQ   = 1e14
+
+    penalty = 0.0
+    for c in constraints:
+        hard = c.get("hard", False)
+        op   = c["op"]
+        W_INEQ = W_HARD_INEQ if hard else W_SOFT_INEQ
+        W_EQ   = W_HARD_EQ   if hard else W_SOFT_EQ
+
+        if c.get("mode", "log") == "K":
+            # K-space: evaluate both sides numerically
+            try:
+                lhs_val = _eval_kspace_expr(c["lhs_expr"], logK_dict, c["param_names"])
+                rhs_val = _eval_kspace_expr(c["rhs_expr"], logK_dict, c["param_names"])
+                val = lhs_val - rhs_val
+            except Exception:
+                continue   # skip unevaluable constraints gracefully
+        else:
+            # Log-space: linear combination
+            val = (sum(coeff * logK_dict.get(name, 0.0)
+                       for name, coeff in c["coeffs"].items())
+                   + c["const"])
+
+        if op == '<':
+            if val > 0:
+                penalty += W_INEQ * val * val
+        elif op == '>':
+            if val < 0:
+                penalty += W_INEQ * val * val
+        else:   # '='
+            penalty += W_EQ * val * val
+
+    return penalty
+
+
 def parse_script(text: str) -> dict:
     result = {
         "concentrations":   {},
@@ -139,7 +559,9 @@ def parse_script(text: str) -> dict:
         "plot_y":           [],
         "nmr":              None,   # None | {"mode": "shift"|"integration", "targets": [str]}
         "spectra":          None,   # None | {"transparent": [str]}
+        "constraints":      [],     # parsed constraint objects (populated after knames known)
     }
+    _raw_constraint_lines = []   # collected during section pass, parsed after all knames known
 
     section = None
     for raw_line in text.splitlines():
@@ -393,6 +815,10 @@ def parse_script(text: str) -> dict:
                 else:
                     result["spectra"]["transparent"] = transparent
 
+        elif section == "constraints":
+            # Collect raw lines; parsed after all parameter names are known
+            _raw_constraint_lines.append(line)
+
     # ── Deduplicate knames across both equilibria and kinetics ───────────────
     from collections import Counter
     all_knames = ([eq["kname"] for eq in result["equilibria"]] +
@@ -413,6 +839,21 @@ def parse_script(text: str) -> dict:
                     kname_seen[kn] += 1
                     rxn[attr] = f"{kn}{kname_seen[kn]}"
 
+    # ── Parse $constraints now that all parameter names are known ─────────────
+    if _raw_constraint_lines:
+        _all_param_names = (
+            [eq["kname"] for eq in result["equilibria"]] +
+            [r["kname"]  for r in result["kinetics"]] +
+            [r["krname"] for r in result["kinetics"] if "krname" in r]
+        )
+        for _cline in _raw_constraint_lines:
+            try:
+                _cs = _parse_constraint_line(_cline, _all_param_names)
+                if _cs:
+                    result["constraints"].extend(_cs)
+            except Exception:
+                pass  # silently skip unparseable lines in fast parse
+
     return result
 
 
@@ -426,7 +867,7 @@ def check_script_syntax(text: str) -> list:
 
     VALID_SECTIONS = {
         "concentrations", "volumes", "titrant", "reactions", "equilibria",
-        "variables", "plot", "nmr", "spectra",
+        "variables", "plot", "nmr", "spectra", "constraints",
     }
     CONC_UNITS  = {"m", "mm", "um", "µm"}
     VOL_UNITS   = {"l", "ml", "ul", "µl"}

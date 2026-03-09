@@ -6,6 +6,7 @@ import pandas as pd
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 from equinix_network import solve_equilibria_general
+from equinix_parser import constraints_penalty
 
 __all__ = ['_kinetics_reaction_label', '_rate_constant_units', '_equilibrium_constant_units', '_collect_all_kinetic_species', 'build_kinetics_logk_dict', 'compute_kinetics_curve', 'fit_kinetics']
 
@@ -217,7 +218,7 @@ def compute_kinetics_curve(parsed: dict, logk_dict: dict, t_max: float, n_pts: i
 
 def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
                  t_max: float, n_pts: int, tolerance: float, maxiter: int,
-                 timeout_s: float = 30.0):
+                 timeout_s: float = 30.0, constraints=None):
     """
     Fit selected log10(k) values to experimental kinetic data.
     exp_data format: {species_name: {"v_add_mL": t_array, "y": y_array}}
@@ -257,6 +258,12 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
             return None
 
     def objective(params_vec):
+        lk = dict(logk_dict)
+        for i, name in enumerate(fit_names):
+            lk[name] = params_vec[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
         curve = _simulate(params_vec)
         if curve is None:
             return 1e12

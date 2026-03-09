@@ -2,11 +2,12 @@
 import numpy as np
 from scipy.optimize import minimize
 from equinix_curve import compute_single_point, find_equiv_for_x, convert_exp_x
+from equinix_parser import constraints_penalty
 
 __all__ = ['fit_parameters']
 
 
-def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_expr, tolerance=1e-6, maxiter=100_000, use_lbfgsb=True, use_neldermead=True):
+def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_expr, tolerance=1e-6, maxiter=100_000, use_lbfgsb=True, use_neldermead=True, constraints=None):
     """
     Fit selected log K parameters to experimental data with robust error handling.
     
@@ -53,6 +54,7 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
         
         # Safe logK range: covers all chemistry, prevents exp overflow in solver.
         LOGK_MIN, LOGK_MAX = -15.0, 15.0
+        _constraints = constraints or []
 
         def objective(fit_params):
             """Overflow-safe objective: suppress numpy warnings, clip logK, return
@@ -61,6 +63,9 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                 current_logKs = logK_vals.copy()
                 for i, pname in enumerate(fit_param_names):
                     current_logKs[pname] = float(np.clip(fit_params[i], LOGK_MIN, LOGK_MAX))
+                cp = constraints_penalty(_constraints, current_logKs)
+                if cp > 0:
+                    return cp
                 residuals = []
                 # Suppress overflow warnings — they're handled by the isfinite check below
                 with np.errstate(over='ignore', invalid='ignore', divide='ignore'):

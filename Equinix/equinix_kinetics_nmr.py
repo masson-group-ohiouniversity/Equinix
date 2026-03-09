@@ -5,6 +5,7 @@ import numpy as np
 from scipy.optimize import minimize
 from equinix_kinetics import compute_kinetics_curve, _collect_all_kinetic_species
 from equinix_fit_nmr import _get_species_for_target, _hessian_errors, _resolve_c
+from equinix_parser import constraints_penalty
 
 __all__ = ['_build_kinetics_stoich', '_kinetics_nmr_integration_backCalc', 'fit_kinetics_nmr_shifts', 'fit_kinetics_nmr_integration', 'fit_kinetics_nmr_mixed']
 
@@ -166,7 +167,7 @@ def _kinetics_nmr_integration_backCalc(nmr_data: dict, n_H_list: list,
 def fit_kinetics_nmr_shifts(parsed: dict, logk_dict: dict, nmr_data: dict,
                              fit_keys: list, t_max: float, n_pts_sim: int,
                              tolerance: float, maxiter: int,
-                             timeout_s: float = 30.0):
+                             timeout_s: float = 30.0, constraints=None):
     """
     Fit rate constants to fast-exchange NMR chemical shift data (kinetics mode).
 
@@ -241,6 +242,29 @@ def fit_kinetics_nmr_shifts(parsed: dict, logk_dict: dict, nmr_data: dict,
         return dd, calc, float(np.sum((dobs_rel - calc)**2))
 
     def objective(logk_trial):
+        lk = logk_dict.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
+        c = _simulate(logk_trial)
+        if c is None: return 1e12
+        total_ssr = 0.0
+        for col, col_data in nmr_data.items():
+            if col.startswith("_"): continue
+            tgt       = col_to_target.get(col, nmr_cfg["targets"][0])
+            sp_coeffs = _get_species_for_target(tgt, parsed, fake_network)
+            if not sp_coeffs: continue
+            t_exp         = col_data["v_add_mL"]
+            delta_obs_rel = col_data["y"] - delta_free[col]
+            X = _build_fraction_matrix(c, t_exp, sp_coeffs, t_free=t_free_val[col])
+            _, _, ssr = _analytic_delta(X, delta_obs_rel)
+            total_ssr += ssr
+        return total_ssr
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
         c = _simulate(logk_trial)
         if c is None: return 1e12
         total_ssr = 0.0
@@ -335,7 +359,7 @@ def fit_kinetics_nmr_shifts(parsed: dict, logk_dict: dict, nmr_data: dict,
     sst  = float(np.sum((y_obs - y_obs.mean())**2)) if len(y_obs) > 1 else 1.0
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / max(len(residuals), 1)))
-    _err_idx = _hessian_errors(objective, result.x, ssr, len(residuals), n_p)
+    _err_idx = _hessian_errors(data_objective, result.x, ssr, len(residuals), n_p)
     param_errors = {fit_keys[i]: _err_idx[i] for i in range(n_p) if i in _err_idx}
 
     stats = {
@@ -359,7 +383,7 @@ def fit_kinetics_nmr_shifts(parsed: dict, logk_dict: dict, nmr_data: dict,
 def fit_kinetics_nmr_integration(parsed: dict, logk_dict: dict, nmr_data: dict,
                                   fit_keys: list, t_max: float, n_pts_sim: int,
                                   tolerance: float, maxiter: int,
-                                  timeout_s: float = 30.0):
+                                  timeout_s: float = 30.0, constraints=None):
     """Fit rate constants to slow-exchange NMR integration data (kinetics mode)."""
     from scipy.optimize import minimize
 
@@ -392,6 +416,23 @@ def fit_kinetics_nmr_integration(parsed: dict, logk_dict: dict, nmr_data: dict,
             return None
 
     def objective(logk_trial):
+        lk = logk_dict.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
+        c = _simulate(logk_trial)
+        if c is None: return 1e12
+        t_sim = c["t"]
+        ssr = 0.0
+        for sp, (t_bc, c_bc) in bc.items():
+            c_th = np.interp(t_bc, t_sim, _resolve_c(c, sp, parsed, t_sim))
+            ssr += float(np.sum((c_bc - c_th) ** 2))
+        return ssr
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
         c = _simulate(logk_trial)
         if c is None: return 1e12
         t_sim = c["t"]
@@ -442,7 +483,7 @@ def fit_kinetics_nmr_integration(parsed: dict, logk_dict: dict, nmr_data: dict,
     sst  = float(np.sum((y_obs_arr - y_obs_arr.mean())**2)) if len(y_obs_arr) > 1 else 1.0
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / max(len(residuals), 1)))
-    _err_idx = _hessian_errors(objective, result.x, ssr, len(residuals), n_p)
+    _err_idx = _hessian_errors(data_objective, result.x, ssr, len(residuals), n_p)
     param_errors = {fit_keys[i]: _err_idx[i] for i in range(n_p) if i in _err_idx}
     sp_concs = {sp: [(t_bc, c_bc)] for sp, (t_bc, c_bc) in bc.items()}
 
@@ -466,7 +507,7 @@ def fit_kinetics_nmr_integration(parsed: dict, logk_dict: dict, nmr_data: dict,
 def fit_kinetics_nmr_mixed(parsed: dict, logk_dict: dict, nmr_data: dict,
                             fit_keys: list, t_max: float, n_pts_sim: int,
                             tolerance: float, maxiter: int,
-                            timeout_s: float = 30.0):
+                            timeout_s: float = 30.0, constraints=None):
     """Fit rate constants to mixed slow+fast exchange NMR data (kinetics mode)."""
     from scipy.optimize import minimize
 
@@ -545,6 +586,27 @@ def fit_kinetics_nmr_mixed(parsed: dict, logk_dict: dict, nmr_data: dict,
         return total
 
     def objective(logk_trial):
+        lk = logk_dict.copy()
+        for i, k in enumerate(fit_keys):
+            lk[k] = logk_trial[i]
+        cp = constraints_penalty(constraints or [], lk)
+        if cp > 0:
+            return cp
+        c = _simulate(logk_trial)
+        if c is None: return 1e12
+        t_sim = c["t"]
+        integ_ssr = 0.0
+        integ_var = max(sum(float(np.var(c_bc)) for _, (_, c_bc) in bc.items()), 1e-20)
+        for sp, (t_bc, c_bc) in bc.items():
+            c_th = np.interp(t_bc, t_sim, _resolve_c(c, sp, parsed, t_sim))
+            integ_ssr += float(np.sum((c_bc - c_th)**2)) / integ_var
+        shift_ssr_raw = _shift_ssr(c)
+        shift_var = max(sum(float(np.var(nmr_data[col2]["y"]))
+                            for col2 in shift_cols), 1e-20) if shift_cols else 1.0
+        return integ_ssr + shift_ssr_raw / shift_var
+
+    def data_objective(logk_trial):
+        """Data-only SSR (no constraint penalty) — used for Hessian / error estimation."""
         c = _simulate(logk_trial)
         if c is None: return 1e12
         t_sim = c["t"]
@@ -653,8 +715,8 @@ def fit_kinetics_nmr_mixed(parsed: dict, logk_dict: dict, nmr_data: dict,
     r2   = (r2_integ * n_integ_pts + r2_shift * n_shift_pts) / max(n_total, 1)
     ssr  = ssr_integ + ssr_shift
     rmse = float(np.sqrt(ssr / max(n_total, 1)))
-    ssr_obj = float(objective(result.x))
-    _err_idx = _hessian_errors(objective, result.x, ssr_obj, n_total, n_p)
+    ssr_obj = float(data_objective(result.x))
+    _err_idx = _hessian_errors(data_objective, result.x, ssr_obj, n_total, n_p)
     param_errors = {fit_keys[i]: _err_idx[i] for i in range(n_p) if i in _err_idx}
 
     col_to_sp = {}; col_to_nH = {}
