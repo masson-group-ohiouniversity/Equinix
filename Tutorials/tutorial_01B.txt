@@ -12,6 +12,6 @@ G + H = GH; log K1 = 4.0
 
 $plot
 xmax = 3.00
-x = Ht
+x = H0
 y = G, H, GH
 
