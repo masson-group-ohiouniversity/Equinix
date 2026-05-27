@@ -9,6 +9,9 @@ numpy>=1.24
 scipy>=1.11
 pandas>=2.0
 
+# Parallel execution (bootstrap, Monte Carlo, jackknife, RMSE profiles)
+joblib>=1.3
+
 # Plotting
 plotly>=5.18
 matplotlib>=3.7          # required for publication-quality PDF export
