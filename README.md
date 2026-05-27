@@ -26,7 +26,7 @@ Runs entirely on your local machine — no data is sent anywhere.
 - **Uncertainty quantification** — non-parametric residual bootstrap, parametric Monte Carlo, and Mammen wild bootstrap; leave-one-out jackknife; Monte Carlo propagation of user-specified relative uncertainty on stock concentrations, titrant stocks and V₀. All three layers are available for every fit mode and can run in parallel across all cores
 - **Local sensitivity (Masson ξ)** — 3<sup>N</sup> paired-difference probe over arbitrary subsets of fitted parameters and held-fixed quantities, returning conditional and marginal standard errors and a coupling ratio
 - **FAIR session save/restore** — single self-contained JSON bundle (script + experimental data with SHA-256 checksum + fit state + every uncertainty and sensitivity result + RNG seed + Python / NumPy / SciPy / joblib versions). Drop the `.json` back into the script uploader to reconstruct the analysis exactly
-- **Excel export** — timestamped workbook with data, script, and parameters tabs; a fourth **spectra** tab (pure-species ε in mM⁻¹ cm⁻¹) is added automatically after any UV-Vis fit and can be reused directly as known-spectra input for a subsequent fit
+- **Excel export** — timestamped workbook with data, script, and parameters tabs
 - **Publication-quality PDF export** — vector text, Arial 9 pt, inward ticks, editable in Illustrator
 - **In-app script editor** — edit and re-run without leaving the browser
 
@@ -101,62 +101,6 @@ Equilibrist/
 ```
 
 A `__pycache__` folder may appear after the first run — this is normal.
-
----
-
-## Quick-start script
-
-```
-$concentrations
-G0 = 1.00 mM
-
-$volumes
-V0 = 500 uL
-
-$titrant
-Ht = 10.00 mM
-
-$reactions
-G + H = GH; log K1 = 4.0
-
-$plot
-xmax = 3.00
-x = H0/G0
-y = G, H, GH
-```
-
-Save as a `.txt` file, upload it with the **Equilibrist Script** uploader in the sidebar, and the simulation runs immediately.
-
----
-
-## Experimental data files
-
-All data files are Excel (`.xlsx`). Column A meaning depends on the mode:
-
-| Mode | Column A |
-|---|---|
-| Solution titration (concentration, NMR, spectra) | Volume of titrant added in **mL** |
-| Solid titration (concentration, NMR, spectra) | Header in cell A1 must be a titrant concentration name (e.g. `H0`, in mM) or an equivalency ratio (e.g. `H0/G0`). Equilibrist converts to equivalents automatically. |
-| Kinetics (all data types) | Time in **seconds** |
-
-Columns B onward: species concentrations (mM), NMR signals (ppm or integrals), or absorbance values depending on the active mode. See the full manual for details.
-
-### UV-Vis spectra files: optional second sheet
-
-When `read:` is present in `$spectra`, Equilibrist looks for a **second sheet** in the uploaded `.xlsx` file containing known pure-species molar absorptivities. Its layout matches the **spectra** tab produced by the Excel export:
-
-| Position | Content |
-|---|---|
-| Cell A1 | Any label (e.g. `λ [nm]`) — ignored |
-| Row 1, columns B+ | Wavelength values in **nm** |
-| Column A, rows 2+ | Species names (only those listed in `read:` are used; others are ignored) |
-| Body (rows 2+, cols B+) | ε in **mM⁻¹ cm⁻¹** — leave cells **empty** (not zero) where no data is available; empty cells are solved freely by the optimizer |
-
-The exported **spectra** tab can be copied directly into a new data file as sheet 2 and used immediately — no reformatting needed.
-
-### NMR files: optional second sheet (v2.0)
-
-When `read:` is present in `$nmr`, Equilibrist looks for a **second sheet** containing known pure-species intrinsic chemical shifts. The layout mirrors the UV-Vis pattern: row 1 carries the signal-column headers, column A lists species names, body cells carry ppm values. Cells left empty (or marked `NaN`) stay free for the optimizer, so a partial pin is supported. Combined with `noref`, this anchors the absolute pure-species shift scale.
 
 ---
 
