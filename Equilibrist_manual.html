@@ -100,9 +100,9 @@
 <body>
 
 <header>
-  <div class="badge">User Manual · v1.0</div>
+  <div class="badge">User Manual · v2.0</div>
   <h1>Equilibrist</h1>
-  <p class="subtitle">A thermodynamic and kinetic solver</p>
+  <p class="subtitle">A thermodynamic and kinetic solver — with a full statistical-validation, identifiability and uncertainty-quantification layer</p>
   <span class="version">Python · Streamlit · Open Source</span>
 </header>
 
@@ -128,6 +128,8 @@
   <a href="#variables">$variables</a>
   <a href="#plot">$plot</a>
   <a href="#nmr">$nmr</a>
+  <a class="sub" href="#nmr-read">read: pinned shifts</a>
+  <a class="sub" href="#nmr-noref">noref: release auto-pin</a>
   <a href="#spectra">$spectra</a>
   <a class="sub" href="#spectra-transparent">transparent / non-emissive</a>
   <a class="sub" href="#spectra-path">path length</a>
@@ -153,7 +155,31 @@
   <a class="sub" href="#outlier-flagging">Outlier Flagging</a>
   <a href="#fitting">Fitting</a>
   <a href="#fit-stats">Fit Statistics</a>
+
+  <span class="nav-section">Statistical Layer</span>
+  <a href="#stats-overview">Overview</a>
+  <a href="#stats-ic">Information criteria</a>
+  <a class="sub" href="#stats-ic-formulas">AIC / AICc / BIC</a>
+  <a class="sub" href="#stats-ic-dw-sw">Durbin–Watson / Shapiro</a>
+  <a href="#stats-residual-panel">Residual diagnostics figure</a>
+  <a href="#stats-profile-1d">1D RMSE profile</a>
+  <a href="#stats-profile-2d">2D RMSE profile</a>
+  <a href="#stats-corr">Correlation heatmap</a>
+  <a href="#stats-ident">Identifiability (sloppy spectrum)</a>
+  <a href="#stats-ttest">Parameter t-tests</a>
+  <a href="#stats-bootstrap">Bootstrap CIs</a>
+  <a class="sub" href="#stats-bs-residual">Residual bootstrap</a>
+  <a class="sub" href="#stats-bs-parametric">Parametric MC</a>
+  <a class="sub" href="#stats-bs-wild">Wild bootstrap</a>
+  <a href="#stats-jackknife">Jackknife</a>
+  <a href="#stats-mc">Monte Carlo (inputs)</a>
+  <a href="#stats-lst">Local sensitivity (ξ)</a>
+  <a href="#stats-compare">Model comparison</a>
+  <a href="#stats-rank">Rank analysis (EFA / TFA)</a>
+
+  <span class="nav-section">Reproducibility</span>
   <a href="#export">Export &amp; Snapshot</a>
+  <a href="#session">Save &amp; Load Session</a>
   <a href="#pubfig">Publication Figures</a>
   <a href="#cycle-detection">Cycle Detection</a>
 
@@ -171,6 +197,11 @@
   <a href="#ex-dg">Free-energy input</a>
   <a href="#ex-acid-base">Acid-base titration</a>
   <a href="#ex-constraints">Constraints</a>
+
+  <span class="nav-section">Worked Examples (Statistical)</span>
+  <a href="#ex-diag-1to1">Diagnostics on 1:1 binding</a>
+  <a href="#ex-diag-21nmr">2D profile + bootstrap (2:1 NMR)</a>
+  <a href="#ex-diag-kinspec">Sloppy spectrum + MC (kinetics + UV-Vis)</a>
 </nav>
 
 <main>
@@ -195,6 +226,14 @@
   <li><strong>Publication-quality figure export</strong> — one-click PDF with vector text, Arial font, for subsequent editing in Adobe Illustrator.</li>
   <li><strong>Thermodynamic cycle detection</strong> — automatic warning when declared equilibrium constants are mutually inconsistent.</li>
   <li><strong>One-click data export</strong> — timestamped Excel file with concentrations and variables, plus PNG snapshot.</li>
+  <li><strong>FAIR session save / restore</strong> — self-contained JSON bundle (script + data + fit state + uncertainty results + RNG seed + library versions) for reproducible archiving alongside a publication.</li>
+  <li><strong>Information criteria (AIC, AICc, BIC) and Akaike weights</strong> — emitted automatically with every fit; F-test for nested model comparison.</li>
+  <li><strong>Residual diagnostics</strong> — Durbin–Watson serial-correlation test and Shapiro–Wilk normality test, plus a four-panel figure (residuals vs predictor, histogram, normal Q–Q, metrics).</li>
+  <li><strong>Identifiability tools</strong> — 1D RMSE profile (pin one, refit rest), 2D RMSE colormap (pin two, refit rest) with Hessian-derived confidence ellipses overlaid, parameter correlation heatmap, eigendecomposition of the Hessian covariance into stiff/sloppy directions, and per-parameter <em>t</em>-tests with user-editable null hypotheses.</li>
+  <li><strong>Three independent uncertainty layers</strong> — non-parametric residual bootstrap (also parametric and Mammen wild), leave-one-out jackknife, and Monte Carlo propagation of user-declared input uncertainties (stock concentrations, titrant stocks, V₀). Each available for every fit mode; bootstrap and MC can run in parallel across all cores.</li>
+  <li><strong>Local sensitivity (Masson ξ)</strong> — a 3<sup>N</sup> paired-difference grid over any user-selected subset of fitted and held-fixed quantities; returns conditional and marginal SEs and a coupling ratio.</li>
+  <li><strong>Spectral rank analysis</strong> — Evolving Factor Analysis (forward + backward), Malinowski IND scree, and Target Factor Analysis on the absorbance matrix for any UV-Vis fit, as an independent cross-check on the model rank.</li>
+  <li><strong>Shift-constraint syntax</strong> — equality groups (<code>shift: A = B = C</code>), monotone chains (<code>shift: A &gt; B &gt; C</code>), and per-column magnitude bounds in <code>$constraints</code> to tame Variable-Projection slack in NMR shift fits.</li>
   <li><strong>Acid-base titration mode</strong> — <code>$reactions acid-base</code> section accepts pKa values directly; Kw, pH variable, and water equilibrium are injected automatically.</li>
   <li><strong>Outlier flagging</strong> — click any experimental data point to exclude it from fitting; hollow markers distinguish excluded from included points; excluded points are absent from publication PDFs.</li>
   <li><strong>In-app script editor</strong> — edit the script directly in the browser without leaving the app.</li>
@@ -689,6 +728,42 @@ integration: <span class="val">3</span>, <span class="val">3</span>, <span class
 <pre><code><span class="sec">$nmr</span>
 integration: <span class="val">3</span>, <span class="val">3</span>   <span class="cmt"># columns B–C: slow-exchange integrals</span>
 shift: Gtot          <span class="cmt"># columns D onward: fast-exchange shifts</span></code></pre>
+
+<h3 id="nmr-read">read: — Pin pure-species shifts from a second sheet</h3>
+<p>When the data workbook carries known intrinsic chemical shifts for one or more species on a second sheet, list those species after <code>read:</code> in <code>$nmr</code>. Equilibrist reads their per-column shifts verbatim from sheet 2 and pins the corresponding intrinsic-shift rows during the Variable Projection step; the remaining species' shifts are still solved analytically at each fit iteration.</p>
+<pre><code><span class="sec">$nmr</span>
+shift: <span class="sp">Gtot</span>, <span class="sp">Htot</span>
+read: <span class="sp">GH</span>, <span class="sp">GH2</span>    <span class="cmt"># intrinsic δ of GH and GH2 read from sheet 2</span></code></pre>
+<p>Sheet 2 layout mirrors the UV-Vis "known spectra" tab: row 1 contains the signal-column headers, column A lists species names, body cells carry intrinsic ppm values. Cells left empty (or with the literal string <code>NaN</code>) mark that particular species × column combination as still free to fit, so a partial pin is supported.</p>
+
+<h3 id="nmr-noref">noref — Release the auto-pinned reference</h3>
+<p>By default, Equilibrist treats the first species in each fast-exchange target group as the math reference and auto-pins its intrinsic shift increment to <code>dd[ref] = 0</code>. The Variable-Projection linear sub-problem is then solved over the non-reference species only, and the reported "pure-species chemical shifts" are absolute ppm: δ<sub>pure</sub> = δ<sub>obs</sub>(at first x) + dd. This is the legacy behavior, identical to v1.0, and is what most users want.</p>
+
+<p>Add a single bare line <code>noref</code> to <code>$nmr</code> to release that auto-pin. Every species' intrinsic shift then enters the linear sub-problem on equal footing — including the reference. What happens next depends on whether a <code>read:</code> anchor is present in the same section:</p>
+
+<table class="kw-table">
+  <thead><tr><th>Configuration</th><th>Shift scale</th><th>Pure-species shift table reports…</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Default</strong> (no <code>noref</code>)</td><td>Anchored by auto-pinning the reference species to dd = 0.</td><td>Absolute ppm: δ<sub>obs</sub>(V=0) + dd. Reference row matches the V=0 observed shift.</td></tr>
+    <tr><td><code>noref</code> + <code>read:</code> anchor</td><td>Anchored externally by the pinned species in sheet 2 (<code>pure_shifts_anchored = True</code>).</td><td>Absolute ppm. The reference species' intrinsic shift is now fitted from the data, not assumed equal to its V=0 observed value.</td></tr>
+    <tr><td><code>noref</code> alone, no <code>read:</code></td><td><strong>Undetermined</strong> — the linear system carries a uniform-shift symmetry (any constant added to every dd leaves δ<sub>obs</sub> unchanged).</td><td>Δδ relative to the math reference, with the table header explicitly relabelled "Δδ relative to math reference". The absolute scale cannot be recovered.</td></tr>
+  </tbody>
+</table>
+
+<pre><code><span class="sec">$nmr</span>
+shift: <span class="sp">Gtot</span>
+read: <span class="sp">GH2</span>      <span class="cmt"># pure-species δ of GH2 read from sheet 2 → anchor</span>
+noref            <span class="cmt"># release auto-pin; GH2 now anchors the absolute scale</span></code></pre>
+
+<div class="callout">
+  <span class="callout-title">When to use noref</span>
+  <p>Reach for <code>noref</code> when (a) you have an independently measured pure-species shift for at least one species — typically a saturated complex from a sample with a large excess of titrant — that you want to enter via <code>read:</code> as the absolute anchor, and (b) you do not want to assume the first species' intrinsic shift equals its V=0 observed value. For straightforward titrations this assumption is harmless and the default mode is preferred.</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">noref without read: is a diagnostic, not a publication output</span>
+  <p>Running <code>noref</code> alone (no <code>read:</code>) still converges — the equilibrium constants and the relative pure-species shift differences are identifiable — but the absolute pure-species shifts are not. The output table is relabelled "Δδ relative to math reference" to make this clear. The numeric fitted constants are unchanged by the choice of anchor.</p>
+</div>
 </section>
 
 <!-- ═══════════════════════════════════════ $SPECTRA ═══════════════════════════════════════ -->
@@ -797,6 +872,34 @@ read: A, B, C             <span class="cmt"># multiple known spectra</span></cod
 <pre><code><span class="sec">$constraints</span>
 <span class="sp">k1</span> <span class="op">+</span> <span class="sp">k2</span> <span class="op">=</span> <span class="val">1e7</span>         <span class="cmt"># sum of two rate constants</span>
 <span class="val">2</span> <span class="op">*</span> <span class="sp">K1</span> <span class="op">+</span> <span class="sp">K2</span> <span class="op">=</span> <span class="val">3e6</span>     <span class="cmt"># weighted sum</span></code></pre>
+
+<h3 id="constraints-shift">Shift constraints — NMR fast-exchange only</h3>
+<p>Variable Projection (VP) in NMR shift mode solves a linear sub-problem <em>X</em> · <em>d</em> ≈ <em>y</em> at every iteration of the non-linear optimizer, where <em>d</em> is the vector of intrinsic species shifts (relative to the reference species). When many species feed into a single observed shift column, that linear sub-problem has slack — it can absorb speciation errors that should otherwise constrain log K's. The <code>shift:</code> constraint lines below restrict <em>d</em> so the slack disappears and the data has to pay for itself in log K rather than in pure-species shifts.</p>
+
+<table class="kw-table">
+  <thead><tr><th>Written as</th><th>Mathematical meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>shift: A = B = C</code></td><td>Equality group — species A, B, C share one intrinsic shift; if the reference species is in the group, all three are pinned to δ = 0.</td></tr>
+    <tr><td><code>shift: A &gt; B &gt; C</code></td><td>Strictly decreasing chain — δ<sub>A</sub> &gt; δ<sub>B</sub> &gt; δ<sub>C</sub> at every iteration.</td></tr>
+    <tr><td><code>shift: A &lt; B &lt; C</code></td><td>Strictly increasing chain (equivalent to the reverse).</td></tr>
+    <tr><td><code>shift: 0.8, free, 1.0</code></td><td>Per-column magnitude bounds — one value per observed shift column, with <code>free</code> meaning unbounded. A numeric value <code>B</code> constrains |δ| ≤ B for that column; sign is determined by the data, not by the user.</td></tr>
+  </tbody>
+</table>
+
+<pre><code><span class="sec">$constraints</span>
+<span class="cmt"># Force the three free-guest tautomers to share one intrinsic shift</span>
+<span class="kw">shift</span>: <span class="sp">G</span> <span class="op">=</span> <span class="sp">GM</span> <span class="op">=</span> <span class="sp">GM2</span>
+
+<span class="cmt"># Bound observed |dd| to 1.0 ppm on each of three signal columns</span>
+<span class="kw">shift</span>: <span class="val">1.0</span>, <span class="val">1.0</span>, <span class="val">1.0</span>
+
+<span class="cmt"># Decreasing intrinsic shifts down the complexation ladder</span>
+<span class="kw">shift</span>: <span class="sp">GH</span> <span class="op">&gt;</span> <span class="sp">GHM</span> <span class="op">&gt;</span> <span class="sp">GHM2</span></code></pre>
+
+<div class="callout">
+  <span class="callout-title">When to use</span>
+  <p>Reach for <code>shift:</code> constraints only when (a) you have NMR shift data, and (b) the unconstrained fit returns intrinsic shifts you do not believe (impossibly large, in the wrong order, or with a free species producing a non-zero δ when the reference is itself free). For straightforward 1:1 or 1:2 fast-exchange titrations they are not needed.</p>
+</div>
 
 <h3 id="constraints-hard">Hard vs soft enforcement</h3>
 <p>By default all constraints are <strong>soft</strong>: violations add a quadratic penalty to the objective. Appending <code>; hard</code> increases the penalty weight by 10⁶, making violation effectively impossible in practice.</p>
@@ -1092,7 +1195,15 @@ read: A, B, C             <span class="cmt"># multiple known spectra</span></cod
 <p>For fixed K, the concentration matrix C is fully determined. ε is solved analytically at each optimizer step: for species with no known spectrum ε is found by lstsq or NNLS; for species declared with <code>read:</code> whose spectrum was loaded from sheet 2, the corresponding ε rows are pinned to the provided values wavelength by wavelength (NaN entries in the known spectrum are treated as free). L-BFGS-B runs first, followed by Nelder-Mead. The optimizer selection checkboxes do not affect spectral fitting — both stages always run.</p>
 
 <h4>Kinetics modes</h4>
-<p>ODE integration (scipy) at each evaluation. All NMR and spectra fitting modes are available in kinetics mode, using time [s] as the x-axis instead of equivalents. The same re-fit loop applies.</p>
+<p>ODE integration (scipy) at each evaluation. All NMR and spectra fitting modes are available in kinetics mode, using time [s] as the x-axis instead of equivalents:</p>
+<ul>
+  <li><strong>Concentration</strong> — directly fit measured species concentrations vs. time.</li>
+  <li><strong>NMR shift</strong> (kinetics, fast exchange) — population-weighted average δ vs. time.</li>
+  <li><strong>NMR integration</strong> (kinetics, slow exchange) — absolute concentrations from peak areas vs. time.</li>
+  <li><strong>NMR mixed</strong> (kinetics, simultaneous slow + fast) — <strong>v2.0.</strong> The same dataset may contain both integration and shift columns; Equilibrist weights the two residual streams into a single objective and reports R² / RMSE per stream. Triggered automatically when <code>$nmr</code> contains both <code>integration:</code> and <code>shift:</code> lines in a kinetic script.</li>
+  <li><strong>UV-Vis / fluorescence spectra</strong> — time-resolved absorbance matrices with Variable-Projection-solved ε.</li>
+</ul>
+<p>The same re-fit loop applies to every kinetics mode.</p>
 <div class="callout warn">
   <span class="callout-title">Kinetics fitting speed</span>
   <p>Each objective evaluation requires a full ODE integration (~20 ms on a typical machine). Fitting 3 or more parameters (e.g. k₁, G₀, H₀ simultaneously) may use the full timeout budget. This is expected — the optimizer tracks the best point seen and returns it when time expires, so <strong>a timed-out fit is still a valid fit</strong>. Increase the Timeout value in the sidebar if you want more optimizer time.</p>
@@ -1145,8 +1256,16 @@ read: A, B, C             <span class="cmt"># multiple known spectra</span></cod
     <tr><td>Data points</td><td>Total number of values used.</td></tr>
     <tr><td>Reduced χ²</td><td>SSR / (n_data − n_params). Shown only when n_data &gt; n_params.</td></tr>
     <tr><td>Evaluations</td><td>Total number of objective function calls across all re-fit passes.</td></tr>
+    <tr><td>AIC | AICc | BIC</td><td><strong>v2.0.</strong> Information criteria for model selection, printed on a single line under the fit summary. AICc applies the small-sample correction recommended when <em>n</em>/<em>p</em> &lt; 40. Lower is better; absolute values have no meaning, only differences between fits to the <em>same</em> data. See the <a href="#stats-ic">Statistical Layer</a> chapter.</td></tr>
+    <tr><td>Durbin–Watson</td><td><strong>v2.0.</strong> Serial-correlation test on the ordered residual sequence. A green check (✓) is shown when 1.5 ≤ <em>d</em> ≤ 2.5; outside this band, "⚠ autocorrelation suspected" appears. Uninformative when residuals have no natural ordering.</td></tr>
+    <tr><td>Shapiro–Wilk <em>p</em></td><td><strong>v2.0.</strong> Normality test on the residuals. The label "(normal)" appears when <em>p</em> ≥ 0.05; "(non-normal)" otherwise. A non-normal flag is the cue to prefer the bootstrap CI over the Hessian standard error.</td></tr>
   </tbody>
 </table>
+
+<div class="callout warn">
+  <span class="callout-title">UV-Vis spectra caveat</span>
+  <p>For UV-Vis fits the residuals are indexed by both spectrum number and wavelength, but the diagnostic indexes them by their natural intra-spectrum smoothness. As a result Durbin–Watson typically reads low and Shapiro–Wilk typically rejects normality — this is a property of smooth spectra, not a defect of the fit. The AIC/AICc/BIC numbers remain comparable across spectra fits to the same data; DW and Shapiro are not.</p>
+</div>
 
 <h3>Fitted constants table</h3>
 <p>Shows each fitted parameter P with its value and uncertainty (from finite-difference Hessian on the data-only objective). The columns differ by parameter type:</p>
@@ -1181,6 +1300,538 @@ read: A, B, C             <span class="cmt"># multiple known spectra</span></cod
 
 <h3>Pure-species chemical shifts table</h3>
 <p>After shift or mixed-mode fitting, reports δ for every species per signal column.</p>
+</section>
+
+<!-- ═══════════════════════════════════════ STATISTICAL LAYER ═══════════════════════════════════════ -->
+<section id="stats-overview">
+<h2>Statistical Diagnostics &amp; Uncertainty</h2><div class="section-line"></div>
+<p>Equilibrist v2.0 ships a complete statistical-validation layer below the standard fit statistics. Every fit — equilibrium or kinetics, in any mode — emits AIC, AICc, BIC, Durbin–Watson, and Shapiro–Wilk automatically. Eight further panels are gated by individual <em>Show…</em> checkboxes that appear in the right panel after fitting, so the page stays uncluttered until a diagnostic is wanted.</p>
+
+<p>The panels are organised into five families:</p>
+
+<div class="os-grid">
+  <div class="os-card">
+    <span class="os-icon">📏</span>
+    <h3>Model assessment</h3>
+    <ul>
+      <li>AIC, AICc, BIC, log-likelihood</li>
+      <li>Durbin–Watson serial-correlation test</li>
+      <li>Shapiro–Wilk normality test</li>
+      <li>Four-panel residual figure</li>
+      <li>Model comparison (Akaike weights, F-test)</li>
+    </ul>
+  </div>
+  <div class="os-card">
+    <span class="os-icon">🎯</span>
+    <h3>Identifiability</h3>
+    <ul>
+      <li>1D RMSE profile (pin one, refit rest)</li>
+      <li>2D RMSE colormap (pin two, refit rest)</li>
+      <li>Parameter correlation heatmap</li>
+      <li>Sloppy-spectrum eigendecomposition</li>
+      <li>Per-parameter <em>t</em>-tests</li>
+    </ul>
+  </div>
+  <div class="os-card">
+    <span class="os-icon">🎲</span>
+    <h3>Uncertainty quantification</h3>
+    <ul>
+      <li>Bootstrap (residual / parametric / wild)</li>
+      <li>Jackknife (leave-one-out)</li>
+      <li>Monte Carlo (input uncertainty)</li>
+    </ul>
+  </div>
+  <div class="os-card">
+    <span class="os-icon">🎚️</span>
+    <h3>Sensitivity</h3>
+    <ul>
+      <li>Masson ξ local-sensitivity test (3<sup>N</sup> paired differences)</li>
+      <li>Conditional and marginal SEs per variable</li>
+      <li>Coupling ratio σ<sub>marg</sub>/σ<sub>cond</sub></li>
+    </ul>
+  </div>
+  <div class="os-card">
+    <span class="os-icon">🧬</span>
+    <h3>Spectral rank (UV-Vis only)</h3>
+    <ul>
+      <li>EFA forward + backward</li>
+      <li>Malinowski IND scree</li>
+      <li>Target Factor Analysis</li>
+    </ul>
+  </div>
+</div>
+
+<div class="callout">
+  <span class="callout-title">Decision flow — which uncertainty to report</span>
+  <p>The asymptotic Hessian SE printed alongside each fitted constant assumes (i) i.i.d. normal residuals, (ii) the optimum is interior to all bounds, and (iii) the SSR surface is locally parabolic. If Durbin–Watson sits cleanly near 2, Shapiro–Wilk passes (<em>p</em> ≥ 0.05), and no constraint or bound is binding, the Hessian SE is trustworthy. When Shapiro fails, use the <strong>residual bootstrap</strong>. When DW &lt; 1.5, use the <strong>wild bootstrap</strong>. When the data is fine but the experimental inputs (stocks, V₀) carry meaningful prep-error, run a <strong>Monte Carlo</strong> alongside the bootstrap — input uncertainty often dominates for supramolecular titrations and is invisible to the residual-noise methods.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Information criteria ─────────────────────────── -->
+<section id="stats-ic">
+<h2>Information criteria — AIC, AICc, BIC</h2><div class="section-line"></div>
+<p>Information criteria let you compare two or more candidate models fitted to the <em>same</em> data on a single scalar that balances goodness-of-fit against model complexity. Equilibrist computes all three after every successful fit and writes them under the fit summary as a single line:</p>
+
+<pre><code>• AIC = 142.18   |   AICc = 142.34   |   BIC = 148.91</code></pre>
+
+<h3 id="stats-ic-formulas">Formulas</h3>
+<p>Under independent Gaussian residuals with variance σ² estimated by σ̂² = SSR/n, the maximised log-likelihood (dropping additive constants that cancel in any pairwise comparison) is</p>
+
+<div class="syntax">ℓ<sub>max</sub> = −(n / 2) · ln(SSR / n)</div>
+
+<p>From which:</p>
+
+<table class="kw-table">
+  <thead><tr><th>Criterion</th><th>Formula</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td>AIC <sup>[Akaike 1974]</sup></td><td>AIC = n · ln(SSR / n) + 2 p</td><td>n / p ≥ 40</td></tr>
+    <tr><td>AICc <sup>[Hurvich–Tsai 1989]</sup></td><td>AICc = AIC + 2 p (p + 1) / (n − p − 1)</td><td>Small-sample correction; always safe to use</td></tr>
+    <tr><td>BIC <sup>[Schwarz 1978]</sup></td><td>BIC = n · ln(SSR / n) + p · ln(n)</td><td>When stronger penalty on extra parameters is desired</td></tr>
+  </tbody>
+</table>
+
+<p>Here <em>n</em> = number of data points entering the fit, <em>p</em> = number of free fitted parameters. The residual variance σ² is treated as a nuisance parameter and is not counted in <em>p</em>.</p>
+
+<div class="callout">
+  <span class="callout-title">Lower is better — but only differences matter</span>
+  <p>Absolute AIC/BIC values are dominated by the additive constants we dropped, so a single AIC of 142 means nothing on its own. Compare two fits to the same data: ΔAIC = AIC<sub>worse</sub> − AIC<sub>better</sub> ≥ 0. A rule of thumb (Burnham &amp; Anderson 2002): ΔAIC ≤ 2 → models are essentially equivalent; 4 ≤ ΔAIC ≤ 7 → considerably less support for the higher model; ΔAIC &gt; 10 → essentially no support for the higher model.</p>
+</div>
+
+<h3 id="stats-ic-dw-sw">Durbin–Watson and Shapiro–Wilk</h3>
+<p>The same line of the fit summary that prints AIC/AICc/BIC carries the Durbin–Watson statistic <em>d</em> and the Shapiro–Wilk <em>p</em>-value:</p>
+
+<pre><code>• Durbin–Watson = 1.79 (✓); Shapiro p = 0.038 (non-normal)</code></pre>
+
+<p><strong>Durbin–Watson</strong> tests neighbour-to-neighbour autocorrelation in the ordered residual sequence:</p>
+
+<div class="syntax">d = Σ<sub>i=2..n</sub> (r<sub>i</sub> − r<sub>i−1</sub>)² / Σ r<sub>i</sub>²</div>
+
+<table class="kw-table">
+  <thead><tr><th>Range</th><th>Indication</th></tr></thead>
+  <tbody>
+    <tr><td>1.5 ≤ d ≤ 2.5</td><td>✓ Consistent with the independent-residuals assumption.</td></tr>
+    <tr><td>d &lt; 1.5</td><td>⚠ Positive autocorrelation. Smooth trend left in residuals — often an under-parameterised model, a baseline drift, or a missing equilibrium / kinetic step.</td></tr>
+    <tr><td>d &gt; 2.5</td><td>⚠ Negative autocorrelation. Rare in titration data; can indicate over-smoothing or weight mis-specification.</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Shapiro–Wilk</strong> tests residual normality: <em>W</em> is the squared correlation between the ordered residuals and the standard-normal quantiles they would be predicted to follow. <em>W</em> ∈ [0, 1] with <em>W</em> near 1 indicating normality. The associated <em>p</em>-value rejects the null of normality when <em>p</em> &lt; 0.05.</p>
+
+<div class="callout warn">
+  <span class="callout-title">Why this matters for reporting</span>
+  <p>The Hessian-based standard errors printed in the <em>Fitted constants</em> table assume Gaussian residuals. When Shapiro fails, the bootstrap (next section) is the recommended fallback — it captures the actual sampling distribution without that assumption.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Residual diagnostics figure ─────────────────────────── -->
+<section id="stats-residual-panel">
+<h2>Residual diagnostics figure</h2><div class="section-line"></div>
+<p>Toggle <strong>📊 Show residual diagnostics</strong> in the right panel to render a four-panel matplotlib figure. The figure can be downloaded as PNG.</p>
+
+<table class="kw-table">
+  <thead><tr><th>Panel</th><th>Content</th><th>Reads as healthy when…</th></tr></thead>
+  <tbody>
+    <tr><td>A — Residuals vs predictor</td><td>Residual y<sub>obs</sub> − y<sub>calc</sub> plotted against the x-axis predictor (titrant volume, time, equivalents, ...) per series, with dashed lines at ±2 × RMSE.</td><td>Random scatter inside the ±2·RMSE band, no trend, no fan.</td></tr>
+    <tr><td>B — Histogram</td><td>Histogram of all residuals with a Gaussian overlay (mean and σ from the data).</td><td>Roughly symmetric, single mode at zero, no heavy tails.</td></tr>
+    <tr><td>C — Normal Q–Q</td><td>Sample quantiles vs. standard-normal quantiles. Diagonal reference line in grey.</td><td>Points lie on the diagonal across the full range, no flattening in the tails.</td></tr>
+    <tr><td>D — Metrics table</td><td>n, p, dof, SSR, RMSE, AIC, AICc, BIC, Durbin–Watson, Shapiro <em>p</em>, residual mean, σ, skew, kurtosis.</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<p>The same expander block also exposes the 1D RMSE profile (next section), so the most-used identifiability check is one click below the residual figure.</p>
+</section>
+
+<!-- ─────────────────────────── 1D RMSE profile ─────────────────────────── -->
+<section id="stats-profile-1d">
+<h2>1D RMSE profile</h2><div class="section-line"></div>
+<p>Toggle <strong>🔍 Show parameter profile (RMSE vs each)</strong> inside the residual-diagnostics expander. For each fitted parameter θ<sub>k</sub>, Equilibrist sweeps θ<sub>k</sub> over a user-set range around its fitted optimum; at every grid point θ<sub>k</sub> is held fixed while every other free parameter is refit; the resulting RMSE is plotted as RMSE / RMSE<sub>min</sub> against Δ log θ<sub>k</sub>.</p>
+
+<p>This is a direct test of parameter identifiability (cf. Venzon &amp; Moolgavkar 1988; Royall 1997; Hancock et al. 2024, §4.4).</p>
+
+<h3>Shape diagnostic</h3>
+<table class="kw-table">
+  <thead><tr><th>Profile shape</th><th>Diagnosis</th></tr></thead>
+  <tbody>
+    <tr><td>Sharp V-shaped valley</td><td>θ<sub>k</sub> is tightly identified by the data. The Hessian SE is trustworthy.</td></tr>
+    <tr><td>Wide U with shallow walls</td><td>θ<sub>k</sub> is identified but loosely — the SE is large but real.</td></tr>
+    <tr><td>Flat / one-sided floor</td><td>θ<sub>k</sub> is unidentified given the other free parameters. The data cannot pin θ<sub>k</sub> independently. The Hessian SE will look small but is meaningless; the optimum is on a ridge.</td></tr>
+  </tbody>
+</table>
+
+<h3>Controls</h3>
+<table class="kw-table">
+  <thead><tr><th>Control</th><th>Default</th><th>Range</th></tr></thead>
+  <tbody>
+    <tr><td>Span (log ±)</td><td>1.0</td><td>0.1 – 3.0</td></tr>
+    <tr><td>Grid points</td><td>11</td><td>Odd integer, ≥ 5</td></tr>
+    <tr><td>Parallel (use all cores)</td><td>off</td><td>on / off (joblib backend)</td></tr>
+  </tbody>
+</table>
+
+<p>Fitted concentrations and titrant concentrations (when present in the parameter list) are profiled on the same Δ log axis — internally converted to log<sub>10</sub>(mM) so equilibrium constants, concentrations, and titrants share a common abscissa.</p>
+
+<div class="callout">
+  <span class="callout-title">Cache behaviour</span>
+  <p>Profile results are cached per (parameter, span, n_pts) tuple in the session state, and are persisted into the JSON session file when you save. Changing only the toggle (without changing the span or grid) re-uses the cached scan instantly.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── 2D RMSE profile ─────────────────────────── -->
+<section id="stats-profile-2d">
+<h2>2D RMSE profile</h2><div class="section-line"></div>
+<p>Toggle <strong>🌐 Show 2D parameter profile (RMSE colormap for a pair)</strong>. Two parameters are pinned simultaneously over an <em>n</em> × <em>n</em> grid centred on their joint optimum; every other free parameter is refit at each grid point. The resulting RMSE matrix is rendered as a colormap with iso-RMSE contours at <strong>1.1, 1.5, 2.0 and 5.0 × RMSE<sub>min</sub></strong>, plus Hessian-derived 1σ (68 %, dashed) and 95 % (solid) joint confidence ellipses overlaid for direct comparison with the asymptotic Gaussian picture.</p>
+
+<h3>Shape diagnostic — pairwise correlation</h3>
+<table class="kw-table">
+  <thead><tr><th>Topology</th><th>Indication</th></tr></thead>
+  <tbody>
+    <tr><td>Round well, centred</td><td>The two parameters are <strong>independently identified</strong>. The Hessian ellipse should match the inner contour.</td></tr>
+    <tr><td>Long diagonal valley along +1 slope</td><td>Strong <strong>positive</strong> correlation. The two parameters compensate each other — e.g. an equilibrium constant K and a host total concentration H₀ in tight binding (cf. Hancock et al. 2024, §5).</td></tr>
+    <tr><td>Long anti-diagonal valley (−1 slope)</td><td>Strong <strong>negative</strong> correlation. Classic case: K₁ vs K₂ in a 1:2 model when the second binding event is weak — the product K₁·K₂ is identified, the individual constants are not.</td></tr>
+    <tr><td>Banana / curved valley</td><td>Non-linear correlation: the Hessian ellipse will under-estimate the true joint uncertainty. Bootstrap or 2D profile is the trustworthy estimate, not ±σ.</td></tr>
+  </tbody>
+</table>
+
+<h3>Controls</h3>
+<table class="kw-table">
+  <thead><tr><th>Control</th><th>Default</th><th>Range</th></tr></thead>
+  <tbody>
+    <tr><td>X-axis parameter</td><td>—</td><td>Any fitted parameter (logK, logk, log conc, log titrant)</td></tr>
+    <tr><td>Y-axis parameter</td><td>—</td><td>Any fitted parameter, ≠ X</td></tr>
+    <tr><td>Span X (log ±)</td><td>0.5</td><td>0.1 – 3.0</td></tr>
+    <tr><td>Span Y (log ±)</td><td>0.5</td><td>0.1 – 3.0</td></tr>
+    <tr><td>Grid (per axis, odd)</td><td>11</td><td>5 – 31</td></tr>
+    <tr><td>Parallel (use all cores)</td><td><strong>on</strong> (recommended — n² refits)</td><td>on / off</td></tr>
+  </tbody>
+</table>
+
+<p>When only two parameters were fitted the pair is auto-selected. The contour figure and the underlying RMSE grid are cached and survive a session-save / restore cycle.</p>
+</section>
+
+<!-- ─────────────────────────── Correlation heatmap ─────────────────────────── -->
+<section id="stats-corr">
+<h2>Parameter correlation heatmap</h2><div class="section-line"></div>
+<p>Toggle <strong>🔗 Show parameter correlation heatmap</strong>. Plots the matrix of Pearson correlation coefficients ρ<sub>ij</sub> computed from the Hessian-derived covariance Σ:</p>
+
+<div class="syntax">ρ<sub>ij</sub> = σ<sub>ij</sub> / √(σ<sub>ii</sub> · σ<sub>jj</sub>) ∈ [−1, +1]</div>
+
+<p>ρ = 0 indicates independently determined parameters; |ρ| close to 1 indicates a pairwise degeneracy. The heatmap is the fastest visual triage of which 2D RMSE profiles are worth running: any |ρ<sub>ij</sub>| &gt; 0.5 is a candidate pair worth inspecting in the 2D profile above.</p>
+
+<div class="callout">
+  <span class="callout-title">Linear vs nonlinear</span>
+  <p>The Hessian covariance is a local-quadratic approximation. When the 2D RMSE profile shows a curved (banana) valley, ρ<sub>ij</sub> under-reports the true coupling, and the heatmap should be read as a lower bound. For nonlinear or constraint-bounded problems the 2D profile is the trustworthy diagnostic; the heatmap is a fast screen.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Identifiability / sloppy spectrum ─────────────────────────── -->
+<section id="stats-ident">
+<h2>Identifiability — sloppy spectrum</h2><div class="section-line"></div>
+<p>Toggle <strong>🔬 Show parameter identifiability (sloppy spectrum)</strong>. Equilibrist eigen-decomposes the parameter covariance Σ into orthogonal directions <strong>v</strong><sub>i</sub> with standard deviations σ<sub>i</sub> = √λ<sub>i</sub> (the square roots of the eigenvalues). Sorting σ<sub>i</sub> from smallest (stiff — best determined) to largest (sloppy — poorly determined) yields the <strong>sloppy spectrum</strong> of Brown &amp; Sethna (2003) and Gutenkunst et al. (2007).</p>
+
+<h3>Three-panel figure</h3>
+<table class="kw-table">
+  <thead><tr><th>Panel</th><th>Content</th></tr></thead>
+  <tbody>
+    <tr><td>A — Spectrum bar chart</td><td>σ<sub>i</sub> on a log scale, smallest at top (stiffest direction). Banner reports the condition number κ = σ<sub>max</sub> / σ<sub>min</sub> and its log<sub>10</sub> ("decades"). κ &gt; 10⁴ ≈ 4 decades is a strong sloppy-model signal — the data constrains some combinations of parameters orders of magnitude better than others.</td></tr>
+    <tr><td>B — Eigendirection composition heatmap</td><td>Rows = eigendirections v<sub>i</sub>, columns = parameters. Each row is a unit vector showing how that direction is built from the original parameters. A direction whose row is dominated by a single parameter implicates that one parameter; a row with comparable weights across several parameters indicates a coupled mode.</td></tr>
+    <tr><td>C — Per-parameter σ<sub>alone</sub></td><td>Bar chart, ranked ascending. σ<sub>alone</sub>(k) = 1 / √H<sub>kk</sub> is the SE that parameter k would have if every other parameter were known exactly (just the diagonal of the Hessian, not the marginal of Σ). The ratio σ<sub>marg</sub> / σ<sub>alone</sub> tells you how much of the marginal Hessian SE is real information vs. coupling-induced inflation.</td></tr>
+  </tbody>
+</table>
+
+<p>For each eigendirection, the side panel also lists its dominant parameter contributors (sorted by |weight|) and tags the direction <em>stiff</em>, <em>intermediate</em>, or <em>sloppy</em> based on its σ relative to the spectrum extremes.</p>
+</section>
+
+<!-- ─────────────────────────── Parameter t-test ─────────────────────────── -->
+<section id="stats-ttest">
+<h2>Parameter significance — <em>t</em>-test</h2><div class="section-line"></div>
+<p>Toggle <strong>📐 Show parameter significance (t-test)</strong>. For each fitted parameter θ<sub>k</sub>, Equilibrist computes</p>
+
+<div class="syntax">t<sub>k</sub> = (θ<sub>k</sub> − θ<sub>k,0</sub>) / σ(θ<sub>k</sub>)</div>
+
+<p>where σ(θ<sub>k</sub>) is the marginal Hessian SE on θ<sub>k</sub> and θ<sub>k,0</sub> is a user-set null hypothesis (default 0). Under Gaussian residuals, t<sub>k</sub> follows a Student-t distribution with df = n − p, from which the two-sided <em>p</em>-value is computed.</p>
+
+<h3>Output table</h3>
+<table class="kw-table">
+  <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>name</td><td>Parameter identifier (e.g. <code>log K1</code>, <code>log G0</code>, <code>log k-1</code>).</td></tr>
+    <tr><td>value</td><td>Fitted point estimate, in log<sub>10</sub> units for K's and concentrations.</td></tr>
+    <tr><td>SE</td><td>Marginal Hessian SE σ(θ<sub>k</sub>).</td></tr>
+    <tr><td>null θ<sub>k,0</sub></td><td>Editable number-input next to each row — defaults to 0; type any value to test a specific hypothesis.</td></tr>
+    <tr><td>t</td><td>Student-t statistic.</td></tr>
+    <tr><td>p</td><td>Two-sided <em>p</em>-value.</td></tr>
+    <tr><td>stars</td><td>*** for p &lt; 0.001, ** for p &lt; 0.01, * for p &lt; 0.05.</td></tr>
+    <tr><td>kind</td><td>Parameter family — "log K", "log conc", "log titrant", "log k", etc.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <span class="callout-title">Typical uses</span>
+  <p>(i) Test whether two equilibrium constants are statistically distinguishable by setting one as θ₀ for the other (or by inspecting the bootstrap CI overlap). (ii) Test whether a fitted concentration agrees with the gravimetric stock value. (iii) Test whether a fitted rate constant is statistically distinguishable from zero (i.e. whether the reaction step is needed).</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Bootstrap ─────────────────────────── -->
+<section id="stats-bootstrap">
+<h2>Bootstrap confidence intervals</h2><div class="section-line"></div>
+<p>Toggle <strong>🔁 Show bootstrap confidence intervals</strong>. The Hessian SEs printed alongside each parameter assume Gaussian residuals and a locally-parabolic SSR surface. Bootstrap drops both assumptions: it estimates the sampling distribution of every fitted parameter <em>empirically</em> by repeating the fit on many synthetic datasets generated from the original one, then reads percentile CIs off that empirical distribution.</p>
+
+<h3>Controls</h3>
+<table class="kw-table">
+  <thead><tr><th>Control</th><th>Default</th><th>Range</th></tr></thead>
+  <tbody>
+    <tr><td>Iterations</td><td>1000</td><td>50 – 10 000</td></tr>
+    <tr><td>Resampling method</td><td>residual</td><td>residual / parametric / wild</td></tr>
+    <tr><td>Parallel (use all cores)</td><td>off</td><td>on / off (joblib)</td></tr>
+  </tbody>
+</table>
+
+<p>A progress bar shows iteration count; after completion the panel reports <em>n</em><sub>success</sub> / <em>n</em><sub>bootstrap</sub> converged fits, wall-clock time, and the method label, followed by a table with columns:</p>
+
+<div class="syntax">parameter · point · median · 95 % CI lo · 95 % CI hi · width</div>
+
+<p>Compare CI<sub>width</sub> / 2 against the Hessian ±1.96 σ printed in the <em>Fitted constants</em> table. A ratio close to 1 confirms the asymptotic SE; a ratio &lt; 1 indicates the Hessian was over-conservative; a ratio &gt; 1 indicates the Hessian was anticonservative and the bootstrap CI should be reported.</p>
+
+<h3 id="stats-bs-residual">Non-parametric residual bootstrap (default)</h3>
+<p>At each iteration, residuals from the converged fit {<em>r</em><sub>1</sub>, …, <em>r</em><sub>n</sub>} are resampled with replacement and added to the model-predicted values <em>ŷ</em><sub>i</sub> to form synthetic <em>y</em><sub>i</sub>*. The full fit is repeated on every synthetic dataset, yielding one set of fitted parameters per iteration. This is the procedure used by Bindfit (Hibbert &amp; Thordarson 2016) and is the recommended default.</p>
+
+<h3 id="stats-bs-parametric">Parametric Monte Carlo</h3>
+<p>Synthetic data are generated by adding Gaussian noise to the model-predicted values, with σ estimated from the residuals: <em>y</em><sub>i</sub>* = <em>ŷ</em><sub>i</sub> + N(0, σ̂²). Faster and lower-variance than the residual bootstrap, but only valid when the Shapiro–Wilk test passes — read the normality flag first.</p>
+
+<h3 id="stats-bs-wild">Wild bootstrap (Mammen 1993)</h3>
+<p>For heteroscedastic data, residuals are scaled by a random multiplier <em>u</em> drawn from Mammen's two-point auxiliary distribution:</p>
+
+<div class="syntax">u ∈ { −(√5 − 1)/2, +(√5 + 1)/2 }   with probabilities { (√5 + 1)/(2√5), 1 − (√5 + 1)/(2√5) }</div>
+
+<p>This preserves the original residual's magnitude (it is scaled, not resampled) but randomly flips its sign, which is robust to variance that depends on the predictor. Use this when the residual vs predictor panel shows a fan shape.</p>
+
+<h3>Per-mode bootstrap routines</h3>
+<table class="kw-table">
+  <thead><tr><th>Fit mode</th><th>Underlying function</th></tr></thead>
+  <tbody>
+    <tr><td>Concentration (equilibrium)</td><td><code>bootstrap_conc</code></td></tr>
+    <tr><td>NMR shift (equilibrium)</td><td><code>bootstrap_nmr_shift</code></td></tr>
+    <tr><td>NMR integration (equilibrium)</td><td><code>bootstrap_nmr_integ</code></td></tr>
+    <tr><td>NMR mixed (equilibrium)</td><td><code>bootstrap_nmr_mixed</code></td></tr>
+    <tr><td>UV-Vis spectra (equilibrium)</td><td><code>bootstrap_spectra</code></td></tr>
+    <tr><td>Kinetics (concentration)</td><td><code>bootstrap_kinetics</code></td></tr>
+    <tr><td>Kinetics + NMR shift</td><td><code>bootstrap_kinetics_nmr_shifts</code></td></tr>
+    <tr><td>Kinetics + NMR integration</td><td><code>bootstrap_kinetics_nmr_integration</code></td></tr>
+    <tr><td>Kinetics + NMR mixed</td><td><code>bootstrap_kinetics_nmr_mixed</code></td></tr>
+    <tr><td>Kinetics + UV-Vis spectra</td><td><code>bootstrap_kinetics_spectra</code></td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <span class="callout-title">Speed</span>
+  <p>1000 residual bootstrap iterations on a typical 1:1 concentration fit complete in ≈ 50 s serial / ≈ 7 s parallel on 8 cores. Kinetic fits with ODE integration are ~30 × slower per iteration; reduce N to 500 and turn parallel on for those.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Jackknife ─────────────────────────── -->
+<section id="stats-jackknife">
+<h2>Jackknife — leave-one-out</h2><div class="section-line"></div>
+<p>Toggle <strong>🪛 Show jackknife (leave-one-out) analysis</strong>. The jackknife (Quenouille 1956; Tukey 1958) drops one experimental observation at a time, refits with the remaining data, and reports the empirical spread of the resulting parameter estimates. Unlike bootstrap, jackknife has a deterministic iteration count — exactly <em>n</em><sub>steps</sub> refits — and exposes which individual data points are most influential.</p>
+
+<h3>What "one observation" means per mode</h3>
+<table class="kw-table">
+  <thead><tr><th>Fit mode</th><th>One jackknife step drops…</th><th>Routine</th></tr></thead>
+  <tbody>
+    <tr><td>Concentration</td><td>One titration step (one volume, all tracked species)</td><td><code>jackknife_conc</code></td></tr>
+    <tr><td>NMR shift</td><td>One x-value (one row across all shift columns)</td><td><code>jackknife_nmr_shift</code></td></tr>
+    <tr><td>NMR integration</td><td>One x-value (one row across all integration columns)</td><td><code>jackknife_nmr_integration</code></td></tr>
+    <tr><td>NMR mixed</td><td>One x-value (slow + fast residuals at that x)</td><td><code>jackknife_nmr_mixed</code></td></tr>
+    <tr><td>UV-Vis spectra (equilibrium)</td><td>One full spectrum (one titration step)</td><td><code>jackknife_spectra</code></td></tr>
+    <tr><td>Kinetics</td><td>One time point</td><td><code>jackknife_kinetics</code></td></tr>
+    <tr><td>Kinetics + NMR shift</td><td>One time point</td><td><code>jackknife_kinetics_nmr_shift</code></td></tr>
+    <tr><td>Kinetics + NMR integration</td><td>One time point</td><td><code>jackknife_kinetics_nmr_integration</code></td></tr>
+    <tr><td>Kinetics + NMR mixed</td><td>One time point</td><td><code>jackknife_kinetics_nmr_mixed</code></td></tr>
+    <tr><td>Kinetics + UV-Vis spectra</td><td>One full spectrum (one time point)</td><td><code>jackknife_kinetics_spectra</code></td></tr>
+  </tbody>
+</table>
+
+<h3>Output</h3>
+<ul>
+  <li>A per-parameter <strong>jack_se</strong> derived from the empirical spread of the <em>n</em><sub>steps</sub> leave-one-out estimates: σ<sub>jack</sub>(θ<sub>k</sub>) = √[(n−1)/n · Σ (θ<sub>k</sub><sup>(−i)</sup> − θ̄<sub>k</sub>)²].</li>
+  <li>The <strong>per-step influence plot</strong> (toggled with <em>Show per-step influence plot</em>) shows, for each parameter, how its fitted value changes when each individual data point is removed. Outliers and leverage points appear as spikes — visual confirmation of any point that disproportionately moves the fit.</li>
+</ul>
+
+<div class="callout">
+  <span class="callout-title">When to prefer jackknife over bootstrap</span>
+  <p>Jackknife is the right tool when (i) you suspect a single observation is a leverage point and want to see its effect quantified, or (ii) you have a small dataset (n &lt; 30) where the percentile bootstrap CI may be unstable. Bootstrap is otherwise more accurate (jackknife systematically underestimates SE for non-smooth statistics).</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Monte Carlo ─────────────────────────── -->
+<section id="stats-mc">
+<h2>Monte Carlo — experimental input uncertainty</h2><div class="section-line"></div>
+<p>Toggle <strong>🎲 Show Monte Carlo (experimental-uncertainty propagation)</strong>. Bootstrap and jackknife treat the experimental inputs (initial concentrations, titrant stocks, V₀) as fixed and only resample the residual noise. In practice those inputs are themselves uncertain — a gravimetric stock prep is good to 2–3 %, a volumetric V₀ to ~0.5–1 % — and that prep-error propagates into the fitted constants. The Monte Carlo panel quantifies that contribution.</p>
+
+<h3>Workflow</h3>
+<div class="steps">
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <h3>Declare relative σ on each input</h3>
+      <p>Equilibrist lists every held-fixed input from the script ($concentrations, $titrant, $volumes V₀) in a 2-column grid. Type a percentage in any row to assign a relative σ (default 0 → that input contributes nothing). Fitted concentrations and titrants are <em>excluded</em> from the nuisance list — they vary as part of the fit, not as prep-error.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <h3>Choose iteration count and parallelism</h3>
+      <p>Default 500 iterations; max 5000. Parallel is recommended whenever ≥ 2 nuisance inputs carry σ &gt; 0.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <h3>Run</h3>
+      <p>At each iteration each nuisance input X<sub>0</sub> is redrawn from N(X<sub>0</sub>, σ<sub>rel</sub>·X<sub>0</sub>) (truncated at zero so concentrations stay non-negative), and the full fit is repeated on the same observed data with the perturbed inputs. The empirical spread of the resulting parameter samples gives the input-uncertainty contribution to each fitted constant's SE.</p>
+    </div>
+  </div>
+</div>
+
+<h3>Typical declared values</h3>
+<table class="kw-table">
+  <thead><tr><th>Input</th><th>Realistic σ<sub>rel</sub></th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Gravimetric stock concentration</td><td>2 – 3 %</td><td>Balance accuracy, MW uncertainty, hygroscopicity</td></tr>
+    <tr><td>Volumetric V₀</td><td>0.5 – 1 %</td><td>Pipette accuracy</td></tr>
+    <tr><td>Path length (UV-Vis)</td><td>0.5 – 2 %</td><td>Cuvette manufacture tolerance</td></tr>
+    <tr><td>Pure-species ε (loaded via <code>read:</code>)</td><td>1 – 3 %</td><td>Reference-spectrum precision</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <span class="callout-title">When MC dominates</span>
+  <p>For tight-binding supramolecular fits with large <em>n</em>/<em>p</em>, the Hessian-derived σ on each fitted constant can be much smaller than the MC σ — meaning the precision is limited by your stock prep, not by spectroscopic noise. Reporting only the Hessian SE in that regime understates the experimentally-limiting uncertainty, sometimes by an order of magnitude. The kinetics + UV-Vis worked example below ($k_1$ = 5.03 × 10⁴ M⁻¹ s⁻¹, $n/p$ = 2090) shows exactly this.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Local sensitivity ─────────────────────────── -->
+<section id="stats-lst">
+<h2>Local sensitivity test (Masson ξ)</h2><div class="section-line"></div>
+<p>Toggle <strong>🎚️ Show Local sensitivity test (Masson)</strong>. The local sensitivity test (LST) is an Equilibrist-original diagnostic that probes how the RMSE responds when an arbitrary user-selected subset of <em>N</em> variables — fitted parameters <strong>and/or</strong> held-fixed quantities — is jointly perturbed in log space. Where bootstrap and MC isolate one source of uncertainty at a time, the LST quantifies the <em>coupling</em> between any pair of variables.</p>
+
+<h3>Definition</h3>
+<p>The user selects <em>N</em> variables (any subset of fitted K's, fitted k's, fitted concentrations, fitted titrants, held-fixed concentrations, held-fixed titrants, V₀) and a step δ in log<sub>10</sub> units. Equilibrist evaluates the RMSE on a 3<sup>N</sup> grid: each variable takes the three values {−δ, 0, +δ} around its optimum, all combinations swept. For every selected variable <em>X</em>, the paired-difference average</p>
+
+<div class="syntax">ξ<sub>X</sub> = ⟨ ( RMSE(X<sub>opt</sub> + δ<sub>X</sub>, others) − RMSE<sub>opt</sub> ) / RMSE<sub>opt</sub> ⟩</div>
+
+<p>is computed over the 2·3<sup>N−1</sup> paired differences in which <em>X</em> is perturbed by ±δ while the other <em>N</em> − 1 variables run through all 3<sup>N−1</sup> configurations of their levels (cf. manuscript eq. 20).</p>
+
+<h3>Output</h3>
+<table class="kw-table">
+  <thead><tr><th>Quantity</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>RMSE<sub>opt</sub></td><td>Baseline RMSE at the fitted optimum.</td></tr>
+    <tr><td>n_grid</td><td>Total grid evaluations = 3<sup>N</sup>.</td></tr>
+    <tr><td>f<sub>X</sub></td><td>The paired-difference average (% RMSE inflation per unit step). Large = surface is curved along X.</td></tr>
+    <tr><td>σ<sub>cond</sub>(X)</td><td>Conditional SE on X: σ<sub>cond</sub> = δ / √(2·N·f<sub>X</sub>). The SE on X that you would have if all other selected variables were fixed at their optima.</td></tr>
+    <tr><td>σ<sub>marg</sub>(X)</td><td>Marginal Hessian SE on X (read from the fit covariance). Available only for fitted parameters; reads "n/a" for held-fixed inputs.</td></tr>
+    <tr><td>coupling = σ<sub>marg</sub> / σ<sub>cond</sub></td><td>How much the marginal SE is inflated by coupling to the other selected variables. Ratio ≈ 1 → X is essentially independent; ratio &gt; 1 → coupling is real and significant.</td></tr>
+  </tbody>
+</table>
+
+<p>A "Show individual paired differences" expander lists every paired-difference value for full transparency.</p>
+
+<div class="callout">
+  <span class="callout-title">Typical investigative questions</span>
+  <p>
+    "How much of the apparent precision on log K depends on the assumed stock concentration?" — select {log K, conc0:G0}.<br>
+    "Are the two binding constants in this 1:2 fit independently identified?" — select {log K1, log K2}; if coupling &gt; 2 the answer is no.<br>
+    "Does the V₀ assumption matter?" — select {log K, V0_mL} and compare σ<sub>cond</sub> against σ<sub>marg</sub>.
+  </p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">Grid grows as 3<sup>N</sup></span>
+  <p>N = 3 → 27 refits; N = 4 → 81; N = 5 → 243. Each refit is a full optimization with the selected variables pinned. Keep N ≤ 4 unless you turn on parallel and have time to spare.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Model comparison ─────────────────────────── -->
+<section id="stats-compare">
+<h2>Model comparison — ΔAIC, ΔBIC, Akaike weights, F-test</h2><div class="section-line"></div>
+<p>Toggle <strong>⚖️ Show model comparison (AIC / BIC / F-test)</strong> below the fit results. Use this to answer the canonical question: <em>is the 1:2 model statistically supported over the 1:1 on this data?</em></p>
+
+<h3>Workflow</h3>
+<div class="steps">
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <h3>Fit model A</h3>
+      <p>Load the simpler script (e.g. 1:1), click <strong>Fit</strong>, then click <strong>Use current fit as Model A</strong> inside the comparison expander. The current <code>fit_stats</code> dict is snapshotted under <code>_fit_stats_A</code>.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <h3>Fit model B</h3>
+      <p>Replace the script with the more complex variant (e.g. 1:2), refit on the <strong>same data</strong>, then click <strong>Use current fit as Model B</strong>.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <h3>Tick "Nested?" if applicable</h3>
+      <p>Default is ticked. A nested pair means the simpler model is a special case of the more complex one (e.g. 1:1 ↔ 1:2 with log K₂ → −∞). Equilibrist enables the F-test only when nested is ticked. Untick for non-nested comparisons; only the IC's are reported in that case.</p>
+    </div>
+  </div>
+</div>
+
+<h3>Output</h3>
+
+<table class="kw-table">
+  <thead><tr><th>Quantity</th><th>Formula / meaning</th></tr></thead>
+  <tbody>
+    <tr><td>ΔAIC, ΔAICc, ΔBIC</td><td>IC<sub>B</sub> − IC<sub>A</sub>; positive ⇒ A preferred.</td></tr>
+    <tr><td>Akaike weights ω<sub>A</sub>, ω<sub>B</sub></td><td>ω<sub>i</sub> = exp(−ΔAIC<sub>i</sub>/2) / Σ exp(−ΔAIC<sub>j</sub>/2). Interpret as the relative likelihood that model <em>i</em> is the best Kullback–Leibler approximation to the truth, given the candidate set (Burnham &amp; Anderson 2002).</td></tr>
+    <tr><td>F-statistic <em>(nested only)</em></td><td>F = [(SSR<sub>A</sub> − SSR<sub>B</sub>) / Δp] / [SSR<sub>B</sub> / (n − p<sub>B</sub>)] with Δp = p<sub>B</sub> − p<sub>A</sub>. Distributed as F(Δp, n − p<sub>B</sub>) under H₀ (the extra parameters in B are zero).</td></tr>
+    <tr><td>F-test <em>p</em>-value</td><td>p &lt; 0.05 ⇒ B's additional parameters are warranted by the data.</td></tr>
+    <tr><td>Interpretation banner</td><td>A short, plain-language verdict — "Models are essentially equivalent", "B is preferred but only weakly", "B's added parameters are not supported by the data", etc., synthesised from ΔAIC, the F-test, and the Akaike weights.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <span class="callout-title">Caveat for nested-ness</span>
+  <p>Stepwise binding hierarchies (1:1 ⊂ 1:2 ⊂ 1:3) are usually nested in the strict sense. Kinetic schemes (e.g. one-step ⊂ two-step) are <em>not</em> always nested — taking a rate constant to zero may not recover the simpler scheme exactly. When in doubt, untick "Nested?" and rely on ΔAIC / Akaike weights alone.</p>
+</div>
+</section>
+
+<!-- ─────────────────────────── Rank analysis ─────────────────────────── -->
+<section id="stats-rank">
+<h2>Spectral rank analysis — EFA, scree, TFA</h2><div class="section-line"></div>
+<p>Toggle <strong>📊 Show data-rank analysis (EFA / scree / TFA)</strong> after a UV-Vis spectra fit. This panel is unique to spectra fits and operates directly on the absorbance matrix <strong>D</strong> (rows = titration / time steps, columns = wavelengths), independently of the chemical model. It answers the question: <em>how many distinct absorbing species does the data support, and do my fitted pure spectra ε agree with the data's intrinsic factor space?</em></p>
+
+<p>Three sub-tools are reported on a single three-panel figure.</p>
+
+<h3>Evolving Factor Analysis (EFA)</h3>
+<p>For each row index <em>k</em> = 1, …, n<sub>obs</sub>, EFA computes the SVD of the leading <em>k</em> rows (forward direction) or the trailing <em>k</em> rows (backward direction) of <strong>D</strong>, and records the resulting singular values σ<sub>i</sub>(k). Plotting σ<sub>i</sub> vs <em>k</em> shows how each chemical species' contribution rises above the noise floor as titration steps are added (forward) or removed (backward). The combined forward + backward view defines the <em>concentration window</em> of each species — the titration range over which it carries detectable absorbance.</p>
+
+<h3>Malinowski IND scree</h3>
+<p>The full-matrix SVD yields one decreasing sequence of singular values σ<sub>1</sub> ≥ σ<sub>2</sub> ≥ … For each candidate rank <em>k</em> Malinowski defines the residual standard deviation</p>
+
+<div class="syntax">RE(k) = √( Σ<sub>j&gt;k</sub> σ<sub>j</sub>² / (r·(c−k)) )</div>
+
+<p>with r = max(n_obs, n_ch), c = min(n_obs, n_ch), and the indicator</p>
+
+<div class="syntax">IND(k) = RE(k) / (c − k)²</div>
+
+<p>The recommended rank is the <em>k</em> that minimises IND. The scree panel plots σ<sub>k</sub> (log scale) and the IND curve on the same axis; in practice the cleanest signature of the true rank is a sharp drop in IND that flattens to a plateau.</p>
+
+<p>The panel also reports the estimated noise floor (geometric mean of the trailing-half singular values) and a signal-to-noise ratio σ<sub>k</sub> / σ<sub>noise</sub> for each k.</p>
+
+<h3>Target Factor Analysis (TFA)</h3>
+<p>For a candidate rank <em>r</em> (default: the IND-argmin), the data column-space projector is P<sub>col</sub> = V<sub>r</sub> V<sub>r</sub><sup>T</sup>, where V<sub>r</sub> is the first <em>r</em> right singular vectors of <strong>D</strong>. Any putative pure spectrum <strong>t</strong> can be tested by projecting it onto P<sub>col</sub> and reading off the relative residual ||<strong>t</strong> − P<sub>col</sub><strong>t</strong>|| / ||<strong>t</strong>||. A small residual confirms the target is reproducible from the data's leading singular vectors — irrespective of which chemical model produced it.</p>
+
+<p>Equilibrist auto-feeds the fitted ε spectra (from the most recent UV-Vis fit) as TFA targets, so the rank-analysis figure simultaneously shows (i) the data's intrinsic rank, (ii) the noise floor, and (iii) which fitted pure species are consistent with that rank.</p>
+
+<div class="callout">
+  <span class="callout-title">Cross-checks</span>
+  <p>The IND-argmin rank should match (or be at most one above) the number of independently absorbing species declared in <code>$reactions</code> (with <code>transparent:</code> species removed). When IND-argmin &lt; model rank, the data does not support the declared model — typically because two species' spectra are too similar and the κ(C) warning will already be firing. When IND-argmin &gt; model rank, the data carries an extra component the chemical model is missing (an impurity, a hidden equilibrium, or baseline drift).</p>
+</div>
 </section>
 
 <!-- ═══════════════════════════════════════ EXPORT ═══════════════════════════════════════ -->
@@ -1227,6 +1878,52 @@ read: A, B, C             <span class="cmt"># multiple known spectra</span></cod
 <div class="callout success">
   <span class="callout-title">Workflow tip</span>
   <p>After a successful fit, export to Excel and copy the <strong>parameters</strong> tab back to your script file to get a new starting-point script with fitted K values already in place. Copy the <strong>spectra</strong> tab into a new data file as sheet 2, add <code>read: SpeciesName</code> to <code>$spectra</code>, and Equilibrist will pin that species' spectrum in the next fit — useful when you have independently measured spectra for one or more pure species.</p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════ SESSION ═══════════════════════════════════════ -->
+<section id="session">
+<h2>Save &amp; Load Session — FAIR-compliant JSON</h2><div class="section-line"></div>
+<p>The Export tab above produces an Excel file optimised for human readers. The Session bundle does something different: it produces a single JSON file that captures the <em>complete</em> state of an analysis — script, data, settings, fit result, and every uncertainty / sensitivity calculation that was run — so that an independent reader on a different machine can reload the file and see the same figures, numbers, and diagnostics. This is the FAIR archival format (Findable, Accessible, Interoperable, Reusable).</p>
+
+<p>Open the <strong>💾 Save current session</strong> expander in the sidebar (it appears once a script is loaded). Add an optional <em>Notes</em> string (e.g. "1:2 binding, run 3, repeat of Fig 4a"). Click <strong>📥 Build session</strong>; the JSON file appears as a one-click download, named <code>Equilibrist_session_YYYYMMDD_HHMMSS.json</code>.</p>
+
+<h3>What the JSON file contains</h3>
+<table class="kw-table">
+  <thead><tr><th>Field</th><th>Content</th></tr></thead>
+  <tbody>
+    <tr><td><code>format</code></td><td><code>equilibrist.session.v2</code>. v1 files are still loadable for backward compatibility.</td></tr>
+    <tr><td><code>saved_at_utc</code></td><td>ISO-8601 timestamp in UTC.</td></tr>
+    <tr><td><code>app_version</code></td><td>Equilibrist version string.</td></tr>
+    <tr><td><code>env</code></td><td>Runtime versions of Python, NumPy, SciPy, joblib — for numerical reproducibility audits.</td></tr>
+    <tr><td><code>seed</code></td><td>Random-number-generator seed used by the bootstrap / Monte Carlo routines in this session. Re-using the same seed reproduces bootstrap and MC numbers bit-for-bit.</td></tr>
+    <tr><td><code>notes</code></td><td>Your free-text label.</td></tr>
+    <tr><td><code>script</code></td><td>Full Equilibrist script (concentrations, volumes, titrant, reactions, plot, nmr, spectra, constraints, ...) — the model definition.</td></tr>
+    <tr><td><code>script_filename</code></td><td>Original .txt filename for the sidebar badge after restore.</td></tr>
+    <tr><td><code>data</code></td><td>The raw bytes of the experimental data file (xlsx / csv / ...), base64-encoded, with a SHA-256 checksum so the integrity can be verified on load.</td></tr>
+    <tr><td><code>data_filename</code> / <code>data_kind</code></td><td>Original filename and free-text type label (<code>experimental</code>, <code>nmr</code>, <code>spectra</code>, ...).</td></tr>
+    <tr><td><code>fit_state</code></td><td>Selected fit parameters, tolerance, maxiter, timeout, wavelength range, NMR mode, allow-negative-ε flag, constraint set, starting log K values, xmax — exactly the configuration that produced <em>fit_result_summary</em>.</td></tr>
+    <tr><td><code>fit_result_summary</code></td><td>Fitted parameters, R², RMSE, AIC, AICc, BIC, Durbin–Watson, Shapiro <em>p</em> from the last successful fit. Excludes bulky arrays (raw residuals, spectra matrices) to keep the file small.</td></tr>
+    <tr><td><code>uq.bootstrap</code></td><td>Summary of the last bootstrap run — method, n_success / n_bootstrap, wall time, per-parameter CI tuples (lo, median, hi). Bulky per-iteration samples are dropped.</td></tr>
+    <tr><td><code>uq.jackknife</code></td><td>Summary of the last jackknife — per-parameter jack_se, n_jack, wall time.</td></tr>
+    <tr><td><code>uq.monte_carlo</code></td><td>Summary of the last MC — per-parameter MC σ, MC median, 95 % CI lo/hi, n_iter, wall time.</td></tr>
+    <tr><td><code>uq.lst</code></td><td>Summary of the last Masson ξ run — per-variable f, σ<sub>cond</sub>, σ<sub>marg</sub>, coupling ratio, the 3<sup>N</sup> grid size, step δ.</td></tr>
+    <tr><td><code>widget_state</code></td><td>Snapshot of the diagnostic-toggle widget states, so when the session is restored the open expanders return open with their last-used spans / grid sizes.</td></tr>
+    <tr><td><code>profile_caches</code></td><td>Computed 1D and 2D RMSE-profile arrays — so the figures redraw instantly on restore without recomputing.</td></tr>
+  </tbody>
+</table>
+
+<h3>Restoring a session</h3>
+<p>Drop the <code>.json</code> file onto the same uploader that accepts <code>.txt</code> scripts (the script-upload control automatically detects JSON). Equilibrist verifies the SHA-256 checksum of the embedded data, restores the script and data into the editor and uploader badges, reinstates every <code>fit_state</code> control to its saved value, and rehydrates each <code>uq.*</code> block into its diagnostic panel. The bootstrap CI table, the jackknife influence plot, and the Monte Carlo histograms re-render without needing to be re-run.</p>
+
+<div class="callout success">
+  <span class="callout-title">Publication archival pattern</span>
+  <p>Save a session immediately before submitting a manuscript. The single JSON file, deposited in a repository alongside the paper, lets any reviewer or reader reconstruct every reported number without needing to re-run anything, on the same Equilibrist version and (via the <code>env</code> block) the same NumPy / SciPy stack. The script is human-readable, the data is verifiably the same bytes you analysed, and every uncertainty layer comes back with the exact CI you cited.</p>
+</div>
+
+<div class="callout warn">
+  <span class="callout-title">Backward compatibility</span>
+  <p>v1 session files saved with earlier development builds are still loadable, but they lack the <code>env</code>, <code>seed</code>, and <code>uq</code> blocks. Reloading a v1 file will give you the script, data, and fit state, but the uncertainty panels will read as empty until you re-run them.</p>
 </div>
 </section>
 
@@ -1681,6 +2378,200 @@ transparent: B</code></pre>
   <p>Upload the script, load experimental data, check the parameters to fit. The <strong>Activate constraints</strong> checkbox appears at the bottom of the parameter list in the sidebar. Run once unconstrained to see the free fit, then check the box and re-run to enforce the relationship.</p>
 </div>
 
+</section>
+
+<!-- ═══════════════════════════════════════ STATISTICAL WORKED EXAMPLES ═══════════════════════════════════════ -->
+<section id="ex-diag-1to1">
+<h2>Worked example: Residual diagnostics on 1:1 binding</h2><div class="section-line"></div>
+<p>The simplest case — a 1:1 host–guest titration — also illustrates the full diagnostic stack at its tightest. Load tutorial 1 (script below; matches manuscript Figure 2):</p>
+
+<pre><code><span class="sec">$concentrations</span>
+<span class="sp">G0</span> = <span class="val">1.00</span> mM
+
+<span class="sec">$volumes</span>
+<span class="sp">V0</span> = <span class="val">500</span> uL
+
+<span class="sec">$titrant</span>
+<span class="sp">Ht</span> = <span class="val">10.00</span> mM
+
+<span class="sec">$reactions</span>
+<span class="sp">G</span> + <span class="sp">H</span> = <span class="sp">GH</span>; <span class="kw">log</span> <span class="sp">K1</span> = <span class="val">4.0</span>
+
+<span class="sec">$plot</span>
+xmax = <span class="val">3.00</span>
+x    = H0/G0
+y    = G, H, GH</code></pre>
+
+<p>Upload the matching concentration data file (62 measured concentrations across 31 H₀/G₀ ratios), check only <strong>log K1</strong> as the fit parameter, and click <strong>Fit</strong>. The fit converges to log K₁ = 3.46 ± 0.01.</p>
+
+<h3>What the diagnostics report</h3>
+<ul>
+  <li><strong>AIC = 142.18 | AICc = 142.34 | BIC = 148.91</strong> — single-parameter fit, useful for the model comparison panel below if you want to test the 1:1 vs 1:2 hypothesis on the same data.</li>
+  <li><strong>Durbin–Watson = 1.92 (✓)</strong> — residuals are not autocorrelated; the 1:1 model captures the structure of the titration curve.</li>
+  <li><strong>Shapiro–Wilk p = 0.0038 (non-normal)</strong> — the residuals are uncorrelated but not Gaussian. The Hessian SE (±0.01 log K) should be cross-checked against the bootstrap.</li>
+</ul>
+
+<h3>Four-panel residual figure</h3>
+<p>Toggle <strong>📊 Show residual diagnostics</strong>. The four panels read as:</p>
+<ul>
+  <li><strong>A</strong> — Residuals scatter randomly inside the ±2·RMSE band for both tracked species (free G and complex GH), with no systematic trend across the H₀/G₀ axis. Confirms the binding model is correctly specified.</li>
+  <li><strong>B</strong> — Histogram of all 62 residuals is symmetric, centred at zero, but flat-topped rather than peaked — the source of Shapiro's failure.</li>
+  <li><strong>C</strong> — Normal Q–Q plot: residuals track the diagonal in the centre but flatten in both tails (visual confirmation of the platykurtic distribution).</li>
+  <li><strong>D</strong> — Metrics table.</li>
+</ul>
+
+<h3>1D RMSE profile</h3>
+<p>Inside the same expander, toggle <strong>🔍 Show parameter profile</strong>. With span = 0.5 and 11 points, log K₁ produces a sharp V-shaped valley: RMSE rises 13-fold within ±0.5 log unit of the optimum. The single fitted parameter is tightly identified by the data — the Hessian SE is genuine information, not coupling-inflated.</p>
+
+<h3>What to report in the paper</h3>
+<div class="callout success">
+  <span class="callout-title">Suggested wording</span>
+  <p>"The 1:1 binding model converged to log K₁ = 3.46 ± 0.01 (Hessian SE). Residual diagnostics show no autocorrelation (Durbin–Watson = 1.92) but a non-normal distribution (Shapiro–Wilk p = 0.0038); the 1D RMSE profile confirms log K₁ is tightly identified by the data (13× RMSE inflation within ±0.5 log unit of the optimum)."</p>
+</div>
+</section>
+
+<section id="ex-diag-21nmr">
+<h2>Worked example: 2D RMSE profile + bootstrap + jackknife + local sensitivity on 2:1 NMR</h2><div class="section-line"></div>
+<p>The 2:1 host–guest titration on NMR chemical shifts (manuscript Figure 3 / 4) is where multiple uncertainty layers diverge and the manual's decision-flow callout earns its keep. Load tutorial 9 (excerpted below):</p>
+
+<pre><code><span class="sec">$concentrations</span>
+<span class="sp">G0</span> = <span class="val">1.00</span> mM
+
+<span class="sec">$volumes</span>
+<span class="sp">V0</span> = <span class="val">500</span> uL
+
+<span class="sec">$titrant</span>
+<span class="sp">Ht</span> = <span class="val">10.00</span> mM
+
+<span class="sec">$reactions</span>
+<span class="sp">G</span>  + <span class="sp">H</span> = <span class="sp">GH</span>;  <span class="kw">log</span> <span class="sp">K1</span>
+<span class="sp">GH</span> + <span class="sp">H</span> = <span class="sp">GH2</span>; <span class="kw">log</span> <span class="sp">K2</span>
+
+<span class="sec">$variables</span>
+<span class="sp">Gtot</span> = G + GH + GH2
+<span class="sp">Htot</span> = H + GH + GH2
+
+<span class="sec">$nmr</span>
+<span class="kw">shift</span>: <span class="sp">Gtot</span>
+<span class="kw">shift</span>: <span class="sp">Htot</span>
+
+<span class="sec">$plot</span>
+xmax = <span class="val">3.00</span>
+x    = H0/G0
+y    = G, H, GH, GH2</code></pre>
+
+<p>The fit converges in 51 iterations to <strong>log K₁ = 4.60 ± 0.42</strong> and <strong>log K₂ = 4.68 ± 0.40</strong> (Hessian SEs).</p>
+
+<h3>What the headline numbers say — and what they hide</h3>
+<ul>
+  <li><strong>Durbin–Watson = 1.79 (✓)</strong> — no autocorrelation.</li>
+  <li><strong>Shapiro–Wilk p = 2.5 × 10⁻⁸</strong> — strongly non-normal residuals. The Hessian SE is suspect.</li>
+  <li><strong>Hessian SE on each log K ≈ 0.4</strong> — wide intervals; the data does not pin either constant tightly.</li>
+</ul>
+
+<h3>2D RMSE profile — independent or correlated?</h3>
+<p>Toggle <strong>🌐 Show 2D parameter profile</strong>, leave the auto-selected (log K₁, log K₂) pair, default spans 0.5 / 0.5, grid 11 × 11, parallel <em>on</em>. The colormap returns a <strong>round well</strong> centred on the optimum — log K₁ and log K₂ are <em>independently identified</em>. The Hessian's wide ellipses are real coverage, not a coupled-mode artefact.</p>
+
+<h3>Three uncertainty layers diverge</h3>
+<p>Open three diagnostic panels in sequence (after the Shapiro failure forces us off the Hessian SE alone):</p>
+
+<table class="kw-table">
+  <thead><tr><th>Layer</th><th>σ on log K₁</th><th>σ on log K₂</th><th>Interpretation</th></tr></thead>
+  <tbody>
+    <tr><td>Hessian (printed in the fit summary)</td><td>0.42</td><td>0.40</td><td>Asymptotic SE — but residuals are non-normal.</td></tr>
+    <tr><td>Jackknife (leave-one-out)</td><td>0.40</td><td>0.40</td><td>Agrees with Hessian — no single point is a leverage point.</td></tr>
+    <tr><td>Bootstrap 500 × residual</td><td>≈ 0.27</td><td>≈ 0.28</td><td><strong>Slightly asymmetric, ≈ 65 % narrower</strong>.<br>95 % CI: log K₁ ∈ [+4.04, +5.09], log K₂ ∈ [+4.25, +5.34].</td></tr>
+  </tbody>
+</table>
+
+<p>With Shapiro rejecting normality, the bootstrap percentile CI is the uncertainty to report — it directly captures the empirical sampling distribution and is not subject to the residual-variance inflation that broadens the Hessian SE.</p>
+
+<h3>Local sensitivity ξ — coupling between K₁ and K₂</h3>
+<p>Toggle <strong>🎚️ Show Local sensitivity test</strong>, select {log K₁, log K₂}, step δ = 0.2 log. Equilibrist evaluates 3² = 9 grid points. The test returns:</p>
+
+<ul>
+  <li>ξ<sub>K1</sub> ≈ 0.33 %, ξ<sub>K2</sub> ≈ 0.28 % — small paired-difference averages, confirming the RMSE surface is rather flat around the optimum, consistent with the round-well 2D profile.</li>
+  <li>σ<sub>cond</sub>(log K₁) ≈ 0.18, σ<sub>cond</sub>(log K₂) ≈ 0.20 — the SE each constant would have if the other were known exactly. Comparable in size to the bootstrap σ.</li>
+  <li>Coupling σ<sub>marg</sub>/σ<sub>cond</sub> ≈ 2.3 for both — the marginal Hessian SE is roughly 2 × inflated by the (still independent but loose) joint identification.</li>
+</ul>
+
+<h3>Chemical conclusion</h3>
+<div class="callout">
+  <span class="callout-title">What the numbers actually say about the chemistry</span>
+  <p>Even at the tighter bootstrap intervals (σ ≈ 0.27 – 0.28), the two binding constants overlap substantially. The fitted Δlog K = 0.08 is well within sampling noise and should <em>not</em> be over-interpreted as a chemically meaningful inequivalence between the two binding events. The "correct" reportable statement is: "log K₁ = 4.60, log K₂ = 4.68 (bootstrap 95 % CI 4.04–5.09 and 4.25–5.34 respectively); the two binding events are not statistically distinguishable on this dataset."</p>
+</div>
+</section>
+
+<section id="ex-diag-kinspec">
+<h2>Worked example: Correlation heatmap, sloppy spectrum, and Monte Carlo on kinetics + UV-Vis</h2><div class="section-line"></div>
+<p>A more elaborate case: a three-rate-constant kinetic scheme <strong>A + B ⇌ C → D</strong> monitored by time-resolved UV-Vis (manuscript Figure 7 / 8). The data covers 6266 absorbance points across multiple wavelengths and time points (<em>n</em>/<em>p</em> = 2090). The fit converges to k₁ = 5.03 × 10⁴ M⁻¹ s⁻¹, k₋₁ = 0.980 s⁻¹, k₂ = 1.99 s⁻¹.</p>
+
+<pre><code><span class="sec">$concentrations</span>
+<span class="sp">A0</span> = <span class="val">0.10</span> mM
+<span class="sp">B0</span> = <span class="val">0.10</span> mM
+
+<span class="sec">$volumes</span>
+<span class="sp">V0</span> = <span class="val">2.00</span> mL
+
+<span class="sec">$reactions</span>
+<span class="sp">A</span> + <span class="sp">B</span> &lt;&gt; <span class="sp">C</span>; <span class="sp">k1</span> = <span class="val">5e4</span>, <span class="sp">k-1</span> = <span class="val">1</span>
+<span class="sp">C</span>       &gt;  <span class="sp">D</span>; <span class="sp">k2</span> = <span class="val">2</span>
+
+<span class="sec">$spectra</span>
+transparent: <span class="sp">B</span>
+
+<span class="sec">$plot</span>
+xmax = <span class="val">10</span>
+x    = time
+y    = A, B, C, D</code></pre>
+
+<h3>Step 1 — Correlation heatmap (which pairs deserve a 2D profile?)</h3>
+<p>Toggle <strong>🔗 Show parameter correlation heatmap</strong>. The Hessian-derived Pearson matrix returns ρ(k₁, k₋₁) = +0.80, ρ(k₋₁, k₂) = −0.80, ρ(k₁, k₂) = −0.48. Two of the three off-diagonals exceed |ρ| &gt; 0.5 — both are worth a 2D RMSE inspection.</p>
+
+<h3>Step 2 — 2D RMSE profiles for the flagged pairs</h3>
+<p>Run the 2D profile twice, once on (k₁, k₋₁) and once on (k₁, k₂):</p>
+<ul>
+  <li>(k₁, k₋₁): a long valley extends predominantly along the k₋₁ axis with a modest diagonal tilt. An equal-and-opposite k₁/k₋₁ pairing — which would indicate a K = k₁/k₋₁ degeneracy — would have produced a 45° diagonal; the tilt is much shallower than that. The pre-equilibrium constant K is well constrained; the individual rate constants are coupled but distinguishable.</li>
+  <li>(k₁, k₂): a roughly round well with modest tilt. The two are coupled but each is independently identified by the data.</li>
+</ul>
+
+<h3>Step 3 — Sloppy-spectrum eigenanalysis</h3>
+<p>Toggle <strong>🔬 Show parameter identifiability (sloppy spectrum)</strong>. Equilibrist returns three eigendirections with σᵢ ranging from 3 × 10⁻⁴ for v₁ (stiffest) to 2 × 10⁻³ for v₃ (sloppiest). The condition number κ ≈ 7 ≈ 0.8 decades — not a sloppy model in the Brown–Sethna sense (which kicks in at &gt; 4 decades), but enough structure to be informative:</p>
+<ul>
+  <li><strong>v₁</strong> (stiffest, σ = 3 × 10⁻⁴) is the best-determined linear combination: coefficients (−0.77, +0.23, +0.59) on (k₁, k₋₁, k₂). The data fixes this particular combination very tightly.</li>
+  <li><strong>v₃</strong> (sloppiest, σ = 2 × 10⁻³) is overwhelmingly aligned with k₋₁ alone (weight −0.97). k₋₁ is the parameter whose value is most weakly constrained.</li>
+  <li>The σ<sub>alone</sub> bar chart ranks k₋₁ as the parameter that would benefit most from external information (e.g. from an independent equilibrium measurement of K).</li>
+</ul>
+
+<h3>Step 4 — Monte Carlo propagation of prep-error</h3>
+<p>With <em>n</em>/<em>p</em> = 2090, the Hessian-derived σ on every rate constant is well below 0.01 (relative ≪ 1 %). The interesting question is whether prep-error dominates. Toggle <strong>🎲 Show Monte Carlo</strong> and assign realistic σ on the inputs:</p>
+
+<table class="kw-table">
+  <thead><tr><th>Input</th><th>σ<sub>rel</sub> declared</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>conc0:A0</td><td>3 %</td><td>Gravimetric stock</td></tr>
+    <tr><td>conc0:B0</td><td>3 %</td><td>Gravimetric stock</td></tr>
+    <tr><td>ε of pure A and C (sheet 2)</td><td>1 %</td><td>Reference UV-Vis precision</td></tr>
+  </tbody>
+</table>
+
+<p>Run 500 iterations in parallel. Equilibrist returns 95 % CIs of</p>
+<ul>
+  <li>k₁ ∈ [4.61 × 10⁴, 5.51 × 10⁴] M⁻¹ s⁻¹  →  relative uncertainty 4.6 %, MC σ ≈ 2.3 × 10³</li>
+  <li>k₋₁ ∈ [0.925, 1.01] s⁻¹  →  relative uncertainty 2.3 %, MC σ ≈ 2.3 × 10⁻²</li>
+  <li>k₂ ∈ [1.90, 2.08] s⁻¹  →  relative uncertainty 2.4 %, MC σ ≈ 4.8 × 10⁻²</li>
+</ul>
+
+<div class="callout danger">
+  <span class="callout-title">When the Hessian SE understates the truth by an order of magnitude</span>
+  <p>These CIs are <strong>dominated by input uncertainty, not residual noise</strong>. At n/p = 2090 the Hessian σ on each rate constant is well below the MC σ. Reporting only the Hessian SE would understate the experimentally-limiting uncertainty by roughly an order of magnitude. This is the most important sanity-check Equilibrist provides: <em>once the Hessian SE drops below the prep-error contribution, the headline number must come from the MC, not the Hessian</em>.</p>
+</div>
+
+<h3>What to report</h3>
+<div class="callout success">
+  <span class="callout-title">Suggested wording</span>
+  <p>"The kinetic fit converged to k₁ = (5.0 ± 0.2) × 10⁴ M⁻¹ s⁻¹, k₋₁ = 0.98 ± 0.02 s⁻¹, k₂ = 1.99 ± 0.05 s⁻¹ (Monte Carlo 95 % CI, propagating 3 % relative uncertainty on the A₀ and B₀ stock concentrations and 1 % on the reference molar absorptivities; n/p = 2090 makes the residual-noise contribution negligible by comparison). The Hessian-derived correlation matrix flagged ρ(k₁, k₋₁) = +0.80 as the dominant pairwise correlation; the 2D RMSE profile confirms the pre-equilibrium constant K = k₁/k₋₁ is well determined while the individual rate constants are coupled but distinguishable. The sloppy-spectrum analysis identifies k₋₁ as the parameter most loosely constrained by the absorbance data alone (eigendirection v₃, weight −0.97)."</p>
+</div>
 </section>
 
 </main>

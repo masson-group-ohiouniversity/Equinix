@@ -524,7 +524,7 @@ def create_snapshot(fig, parsed, params, logK_vals, xmax=None,
 
     # ── Figure layout: plot (left) + text panel (right) ──────────────────
     fig_out, (ax_plot, ax_text) = plt.subplots(
-        1, 2, figsize=(8.0, 3.2),
+        1, 2, figsize=(8.0, 5.5),
         gridspec_kw={"width_ratios": [1, 0.72]})
 
     # ── Draw the plot traces ──────────────────────────────────────────────
@@ -682,9 +682,16 @@ def load_experimental_data(file_bytes) -> dict:
         The column header is stored under the key "_x_col_header" in the result.
       - Subsequent columns: species/variable names
 
+    Optional sheet 2 — known intrinsic chemical shifts (NMR):
+      Each row: col A = species name, cols B+ = absolute chemical shift values
+      (one per shift column in sheet 1, in the same column order).
+      Rows whose col A is empty/non-string are skipped.  Stored under key
+      "_known_shifts" as {species: np.ndarray of shift values}.
+
     Returns dict:
       {column_name: {"v_add_mL": np.ndarray, "y": np.ndarray}}
       plus "_x_col_header": str  (the header of column A)
+      plus "_known_shifts": {species: np.ndarray} (may be empty)
     where NaN rows are already dropped per column.
     """
     try:
@@ -705,7 +712,7 @@ def load_experimental_data(file_bytes) -> dict:
         if x_series.dropna().empty:
             return {}
         
-        result = {"_x_col_header": str(x_col)}
+        result = {"_x_col_header": str(x_col), "_known_shifts": {}}
         for col in data_cols:
             try:
                 col_series = pd.to_numeric(df[col], errors='coerce')
@@ -721,7 +728,35 @@ def load_experimental_data(file_bytes) -> dict:
                         }
             except Exception:
                 continue
-        
+
+        # ── Optional sheet 2: known intrinsic chemical shifts ────────────────
+        # Layout: col A = species name (string), cols B+ = numeric values.
+        # No header row required; non-string values in col A are skipped.
+        try:
+            df2 = pd.read_excel(io.BytesIO(file_bytes), header=None, sheet_name=1)
+            if not df2.empty and df2.shape[1] >= 2:
+                known = {}
+                for _, row in df2.iterrows():
+                    name = row.iloc[0]
+                    if not isinstance(name, str):
+                        continue
+                    name = name.strip()
+                    if not name:
+                        continue
+                    vals = pd.to_numeric(row.iloc[1:], errors='coerce').to_numpy(dtype=float)
+                    # Trim trailing NaNs (allow Excel's auto-padded blank cells)
+                    last = len(vals)
+                    while last > 0 and not np.isfinite(vals[last - 1]):
+                        last -= 1
+                    if last == 0:
+                        continue
+                    known[name] = vals[:last]
+                if known:
+                    result["_known_shifts"] = known
+        except Exception:
+            # Sheet 2 is optional; silently skip if absent or malformed
+            pass
+
         return result
         
     except Exception:
@@ -1041,7 +1076,33 @@ def _plot_backcalc_dots(fig, c_bc_pairs: dict, plot_y_names: list,
         if name in c_on_ref:
             y_arr = c_on_ref[name]
         elif name in variables:
-            # Evaluate $variable expression pointwise from back-calc concentrations
+            # Evaluate $variable expression pointwise from back-calc concentrations.
+            #
+            # Skip when ANY species referenced (transitively) by this variable
+            # is missing from the back-calc.  Previously the guard skipped only
+            # when NO referenced species was back-calculable; that allowed
+            # variables mixing recoverable + missing species to plot with
+            # zero-substituted contributions, which silently understated the
+            # variable's value.  Requiring full coverage is more honest: if any
+            # contributor is unknown from the data, we can't honestly plot the
+            # sum.
+            referenced = set()
+            _to_resolve = [name]
+            _seen_vars = set()
+            import re as _re
+            while _to_resolve:
+                _v = _to_resolve.pop()
+                if _v in _seen_vars: continue
+                _seen_vars.add(_v)
+                _expr = variables.get(_v, "")
+                for _tok in _re.findall(r"[A-Za-z_]\w*", _expr):
+                    if _tok in variables:
+                        _to_resolve.append(_tok)
+                    elif _tok in all_species:
+                        referenced.add(_tok)
+            if referenced and not referenced.issubset(set(c_on_ref.keys())):
+                continue   # at least one species not back-calculable → skip honestly
+
             fake_curve   = {sp: c_on_ref.get(sp, np.zeros(n_pts)) for sp in all_species}
             fake_network = {"all_species": all_species}
             y_arr = compute_variable_curve(name, variables, fake_curve,

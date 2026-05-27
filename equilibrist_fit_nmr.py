@@ -8,6 +8,7 @@ from equilibrist_network import compute_variable_curve, _sanitise_pct
 from equilibrist_curve import convert_exp_x, find_equiv_for_x, compute_single_point
 from equilibrist_curve import compute_curve, evaluate_x_expression
 from equilibrist_parser import constraints_penalty
+from equilibrist_shift_constraints import solve_shifts, get_per_column_bounds
 
 __all__ = ['compute_nmr_curves', '_get_species_for_target', '_hessian_errors', 'fit_nmr_shifts', '_resolve_c', '_nmr_integration_backCalc', 'fit_nmr_integration', 'fit_nmr_mixed']
 
@@ -95,9 +96,18 @@ def _get_species_for_target(target: str, parsed: dict, network: dict) -> list:
 
 
 def _hessian_errors(objective_fn, x_best: np.ndarray, ssr_best: float,
-                    n_data: int, n_params: int, step: float = 1e-3) -> dict:
+                    n_data: int, n_params: int, step: float = 1e-3):
     """
     Estimate ±log K errors from the finite-difference Hessian of the objective.
+
+    Returns a tuple ``(errors_by_index, cov_matrix)``:
+      * ``errors_by_index`` — ``{i: σᵢ}`` mapping the position in
+        ``x_best`` to the marginal standard error.  Same as the legacy
+        return value used by callers.
+      * ``cov_matrix`` — the full ``n × n`` covariance matrix as a
+        numpy array (or ``None`` on numerical failure).  Off-diagonal
+        elements give the parameter covariances that the diagnostics
+        layer normalises to a correlation matrix for the heatmap.
 
     Method
     ──────
@@ -115,12 +125,10 @@ def _hessian_errors(objective_fn, x_best: np.ndarray, ssr_best: float,
 
     σ² = SSR / (n - p)  is the reduced chi-squared.
     Error on parameter i = sqrt(Cov[i,i]) in log K units.
-
-    Returns {fit_key: error_in_log_K} or {} on numerical failure.
     """
     n = len(x_best)
     if n == 0 or n_data <= n_params:
-        return {}
+        return {}, None
 
     sigma2 = max(ssr_best / (n_data - n_params), 1e-30)
     h = np.abs(x_best) * step
@@ -157,16 +165,17 @@ def _hessian_errors(objective_fn, x_best: np.ndarray, ssr_best: float,
         errors = {}
         for i in range(n):
             errors[i] = float(np.sqrt(max(cov[i, i], 0.0)))
-        return errors
+        return errors, cov
     except Exception:
-        return {}
+        return {}, None
 
 
 def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
                    params: dict, logK_vals: dict, fit_keys: list,
                    x_expr: str, tolerance: float, maxiter: int,
                    timeout_s: float = 30.0, constraints=None,
-                   fit_conc_keys=None, fit_titrant_keys=None):
+                   fit_conc_keys=None, fit_titrant_keys=None,
+                   *, compute_hessian: bool = True):
     """
     Fit equilibrium constants + per-signal pure-species shifts to NMR data.
 
@@ -263,6 +272,16 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
     _bounds_conc_nmr    = [_cb_nmr(cn, _x0_conc_nmr[i])    for i, cn in enumerate(fit_conc_keys)]
     _bounds_titrant_nmr = [_tb_nmr(tk, _x0_titrant_nmr[i]) for i, tk in enumerate(fit_titrant_keys)]
 
+    # Per-K soft bounds from the script's 'from X to Y' syntax (defaults if absent).
+    # Honored as a quadratic penalty in objective() since Nelder-Mead ignores `bounds`.
+    _DEFAULT_LO_K, _DEFAULT_HI_K = -2.0, 14.0
+    _eq_by_kname_nmr = {eq["kname"]: eq for eq in parsed.get("equilibria", [])}
+    def _resolve_k_bound_nmr(k, attr, default):
+        v = _eq_by_kname_nmr.get(k, {}).get(attr)
+        return float(v) if v is not None else float(default)
+    _k_lo_nmr = np.array([_resolve_k_bound_nmr(k, "logK_lo", _DEFAULT_LO_K) for k in fit_keys])
+    _k_hi_nmr = np.array([_resolve_k_bound_nmr(k, "logK_hi", _DEFAULT_HI_K) for k in fit_keys])
+
     def _update_bds_nmr(fitted_x):
         """Recentre bounds to ±20% of current fitted values after each pass."""
         for _i, _cn in enumerate(fit_conc_keys):
@@ -274,7 +293,7 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
 
     def _make_simplex_steps_nmr():
         """Step = full feasible range (hi - lo) per concentration/titrant dim."""
-        k_steps = np.full(_n_k, 1.5)
+        k_steps = np.full(_n_k, (1e-9 if maxiter <= 1 else 1.5))
         c_steps = np.array([_bounds_conc_nmr[i][1]    - _bounds_conc_nmr[i][0]
                             for i in range(_n_c)])
         t_steps = np.array([_bounds_titrant_nmr[i][1] - _bounds_titrant_nmr[i][0]
@@ -313,14 +332,24 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
         return convert_exp_x(col_data["v_add_mL"], x_expr, parsed, _params or params, network,
                              x_col_header=_x_col_header)
 
-    def _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=None, df_theoretical=None):
+    def _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=None,
+                                df_theoretical=None, include_ref=False):
         """
-        Build design matrix X of shape (n_pts, N-1).
-        X[:,i] = weighted mole fraction of non-free species i.
-        Fᵢ(x) = nᵢ·[Sᵢ](x) / Σⱼ nⱼ·[Sⱼ](x)
+        Build design matrix X of shape (n_pts, N) or (n_pts, N-1).
 
-        If x_free is given, subtract the theoretical δ at that reference point
-        so the regression is for Δδ relative to the same anchor as the data.
+        Fᵢ(x) = nᵢ·[Sᵢ](x) / Σⱼ nⱼ·[Sⱼ](x)   = mole fraction of species i
+
+        If ``include_ref=False`` (default / legacy): builds X with N−1 columns
+        for the non-reference species (sp_coeffs[1:]), used in the dd_ref ≡ 0
+        formulation.
+
+        If ``include_ref=True``: builds X with N columns for ALL species
+        in the target (including sp_coeffs[0]), used in the noref formulation
+        where every species has its own free dd parameter.
+
+        If ``x_free`` is given, subtract the theoretical δ at that reference
+        point so the regression is for Δδ relative to the same anchor as the
+        data.
         """
         x_sim, _ = evaluate_x_expression(x_expr, c, parsed)
         n_pts = len(x_exp)
@@ -331,33 +360,105 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
             denom += coeff * np.interp(x_exp, x_sim, c.get(sp, np.zeros_like(x_sim)))
         denom = np.maximum(denom, 1e-20)
 
-        # X[:,i] = nᵢ·[Sᵢ] / denom  for non-free species
-        free_sp = sp_coeffs[0][1]
-        non_free = sp_coeffs[1:]
-        X = np.zeros((n_pts, len(non_free)))
-        for i, (coeff, sp) in enumerate(non_free):
+        # Choose which species get columns
+        if include_ref:
+            cols_sp = list(sp_coeffs)             # all species
+        else:
+            cols_sp = list(sp_coeffs[1:])         # non-reference only
+
+        # X[:,i] = nᵢ·[Sᵢ] / denom
+        X = np.zeros((n_pts, len(cols_sp)))
+        for i, (coeff, sp) in enumerate(cols_sp):
             X[:, i] = coeff * np.interp(x_exp, x_sim, c.get(sp, np.zeros_like(x_sim))) / denom
 
         # If a reference x-point is given, subtract the fraction at that point
         # so the model predicts Δδ = 0 at the first measurement (as data does)
         if x_free is not None:
-            X_ref = np.zeros(len(non_free))
+            X_ref = np.zeros(len(cols_sp))
             denom_ref = sum(coeff * float(np.interp(x_free, x_sim, c.get(sp, np.zeros_like(x_sim))))
                             for coeff, sp in sp_coeffs)
             denom_ref = max(denom_ref, 1e-20)
-            for i, (coeff, sp) in enumerate(non_free):
+            for i, (coeff, sp) in enumerate(cols_sp):
                 X_ref[i] = coeff * float(np.interp(x_free, x_sim,
                                                      c.get(sp, np.zeros_like(x_sim)))) / denom_ref
             X = X - X_ref[np.newaxis, :]
 
         return X
 
-    def _analytic_delta(X, delta_obs_rel):
+    # Capture user shift constraints once for this fit (cheap to look up)
+    _shift_constraints = parsed.get("shift_constraints", []) or []
+
+    # Per-column bounds (the 'shift: -0.8, free, 1.0, ...' syntax).  Build a
+    # {col_name: bound_value_or_None} map for use by the inner solver.
+    _per_col_bounds = get_per_column_bounds(_shift_constraints)
+    _col_to_bound = {}
+    if _per_col_bounds is not None:
+        _shift_cols_in_order = [c for c in nmr_data if not c.startswith("_")]
+        if len(_per_col_bounds) != len(_shift_cols_in_order):
+            return False, {}, {}, (
+                f"Per-column shift bounds list has {len(_per_col_bounds)} entries "
+                f"but the data has {len(_shift_cols_in_order)} shift columns. "
+                f"Use 'free' for columns you don't want to constrain."
+            )
+        _col_to_bound = dict(zip(_shift_cols_in_order, _per_col_bounds))
+
+    # Pinned intrinsic shifts: $nmr 'read:' species + sheet-2 known shifts.
+    # Convert absolute ppm in sheet 2 to dd values via dd_X[col] = δ_X − δ_obs(x_free, col).
+    # Built as {col_name: {species: dd_value}} for per-column lookup.
+    _read_species  = list(nmr_cfg.get("read", []) or [])
+    _known_shifts  = nmr_data.get("_known_shifts", {}) or {}
+    _col_to_pinned = {}
+    if _read_species:
+        _shift_cols_in_order = [c for c in nmr_data if not c.startswith("_")]
+        for sp in _read_species:
+            if sp not in _known_shifts:
+                return False, {}, {}, (
+                    f"$nmr 'read: {sp}' but species '{sp}' not found in sheet 2 of "
+                    f"the data file (expected row with '{sp}' in column A and "
+                    f"{len(_shift_cols_in_order)} chemical-shift values to its right)."
+                )
+            vals = _known_shifts[sp]
+            if len(vals) != len(_shift_cols_in_order):
+                return False, {}, {}, (
+                    f"$nmr 'read: {sp}': sheet 2 has {len(vals)} values for '{sp}' "
+                    f"but the data has {len(_shift_cols_in_order)} shift columns. "
+                    f"Provide one value per shift column, in the same order."
+                )
+            for k, col in enumerate(_shift_cols_in_order):
+                dd_val = float(vals[k]) - float(delta_free[col])
+                _col_to_pinned.setdefault(col, {})[sp] = dd_val
+
+    # NMR-level noref flag — when True, every solve_shifts call is run in
+    # noref mode (no auto-pin to reference), requiring at least one read:
+    # anchor.  Default False preserves legacy "Δδ relative to ref" behavior.
+    _nmr_noref = bool(nmr_cfg.get("noref", False))
+
+    def _analytic_delta(X, delta_obs_rel, sp_coeffs=None, column_bound=None,
+                        pinned_dd=None):
+        """Solve the per-column shift sub-problem.  X must have a column for
+        every species in sp_coeffs (build with include_ref=True).
+        Returns (dd, calc, ssr) where dd[i] corresponds to sp_coeffs[i]."""
         if X.shape[1] == 0:
             return np.array([]), np.zeros_like(delta_obs_rel), float(np.sum(delta_obs_rel**2))
-        dd = np.linalg.lstsq(X, delta_obs_rel, rcond=None)[0]
-        calc = X @ dd
-        return dd, calc, float(np.sum((delta_obs_rel - calc)**2))
+        if sp_coeffs is None:
+            # Legacy fall-through (no species info): bare lstsq
+            dd = np.linalg.lstsq(X, delta_obs_rel, rcond=None)[0]
+            calc = X @ dd
+            return dd, calc, float(np.sum((delta_obs_rel - calc)**2))
+        species = [sp for _, sp in sp_coeffs]
+        ref_sp  = sp_coeffs[0][1]
+        try:
+            return solve_shifts(X, delta_obs_rel, species, ref_sp,
+                                _shift_constraints,
+                                column_bound=column_bound,
+                                pinned_dd=pinned_dd,
+                                noref=_nmr_noref)
+        except ValueError:
+            # Bad constraint topology — fall back to unconstrained lstsq so
+            # the fit still runs (the parser warning will alert the user).
+            dd = np.linalg.lstsq(X, delta_obs_rel, rcond=None)[0]
+            calc = X @ dd
+            return dd, calc, float(np.sum((delta_obs_rel - calc)**2))
 
     def objective(trial):
         logk_trial = trial[:len(fit_keys)]
@@ -365,6 +466,10 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
         for i, k in enumerate(fit_keys):
             lk[k] = logk_trial[i]
         conc_penalty = 0.0
+        # Penalty for log-K outside per-K bounds
+        for kv, _lo, _hi in zip(logk_trial, _k_lo_nmr, _k_hi_nmr):
+            if kv < _lo: conc_penalty += 1e6 * (kv - _lo) ** 2
+            elif kv > _hi: conc_penalty += 1e6 * (kv - _hi) ** 2
         if fitting_concs:
             n_k = len(fit_keys)
             for i in range(len(fit_conc_keys)):
@@ -387,8 +492,8 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
             x_exp         = _x_for_col(col_data, _p)
             _xfv          = float(x_exp[0])
             delta_obs_rel = col_data["y"] - delta_free[col]
-            X = _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=_xfv)
-            _, _, ssr = _analytic_delta(X, delta_obs_rel)
+            X = _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=_xfv, include_ref=True)
+            _, _, ssr = _analytic_delta(X, delta_obs_rel, sp_coeffs, _col_to_bound.get(col), _col_to_pinned.get(col))
             total_ssr += ssr
         cp = constraints_penalty(constraints or [], lk, ssr_scale=total_ssr)
         return total_ssr + cp + conc_penalty
@@ -407,8 +512,8 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
             x_exp         = _x_for_col(col_data, _p)
             _xfv          = float(x_exp[0])
             delta_obs_rel = col_data["y"] - delta_free[col]
-            X = _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=_xfv)
-            _, _, ssr = _analytic_delta(X, delta_obs_rel)
+            X = _build_fraction_matrix(c, x_exp, sp_coeffs, x_free=_xfv, include_ref=True)
+            _, _, ssr = _analytic_delta(X, delta_obs_rel, sp_coeffs, _col_to_bound.get(col), _col_to_pinned.get(col))
             total_ssr += ssr
         return total_ssr
 
@@ -516,6 +621,10 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
     ref_corrections = {}   # {col: float} — correction at reference x-point
     all_residuals   = []
     all_y_obs       = []
+    # v2: per-column observed and calculated arrays for bootstrap resampling
+    per_col_y_obs   = {}   # {col: ndarray of Δδ_obs_rel}
+    per_col_y_calc  = {}   # {col: ndarray of Δδ_calc_rel}
+    per_col_x       = {}   # {col: ndarray of x-axis values}
 
     if c_final is not None:
         for col, col_data in nmr_data.items():
@@ -529,44 +638,64 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
             df_exp        = delta_free[col]
             delta_obs_rel = delta_obs - df_exp
 
-            X  = _build_fraction_matrix(c_final, x_exp, sp_coeffs, x_free=x_free_val[col])
-            dd, delta_calc_rel, _ = _analytic_delta(X, delta_obs_rel)
+            X  = _build_fraction_matrix(c_final, x_exp, sp_coeffs, x_free=x_free_val[col], include_ref=True)
+            dd, delta_calc_rel, _ = _analytic_delta(X, delta_obs_rel, sp_coeffs, _col_to_bound.get(col), _col_to_pinned.get(col))
 
             all_residuals.extend((delta_obs_rel - delta_calc_rel).tolist())
             all_y_obs.extend(delta_obs_rel.tolist())   # use Δδ, not absolute ppm
+            per_col_y_obs[col]  = np.asarray(delta_obs_rel,  dtype=float)
+            per_col_y_calc[col] = np.asarray(delta_calc_rel, dtype=float)
+            per_col_x[col]      = np.asarray(x_exp,          dtype=float)
 
-            free_sp  = sp_coeffs[0][1]
-            non_free = [sp for _, sp in sp_coeffs[1:]]
-            sp_dd    = {free_sp: 0.0}
-            for i, sp in enumerate(non_free):
-                sp_dd[sp] = float(dd[i]) if i < len(dd) else 0.0
+            # In the new convention: dd[i] = δ_i_absolute − δ_obs(V=0).
+            # `dd` is the full per-species vector (same order as sp_coeffs).
+            # In legacy mode (auto-pin ref to dd=0) dd[ref]=0; in noref mode
+            # dd[ref] is fitted from the data.
+            sp_dd = {sp: float(dd[i]) if i < len(dd) else 0.0
+                     for i, (_, sp) in enumerate(sp_coeffs)}
+            # When the absolute shift scale is NOT anchored by a read: pin,
+            # subtract dd[ref] from every species so the math reference reads
+            # as 0.  This makes legacy and noref-no-read produce identical
+            # "Δδ relative to ref" output.  (When anchored, leave dd alone so
+            # we can recover absolute δ as δ_obs(V=0) + dd.)
+            if not (_nmr_noref and _read_species):
+                ref_sp = sp_coeffs[0][1]
+                ref_dd = sp_dd.get(ref_sp, 0.0)
+                if abs(ref_dd) > 1e-12:
+                    sp_dd = {k: v - ref_dd for k, v in sp_dd.items()}
             delta_vecs_all[col] = sp_dd
 
             if len(sp_coeffs) == 2:
-                delta_bound_all[col] = float(dd[0]) if len(dd) > 0 else 0.0
+                # 2-species target: store the non-ref dd in delta_bound_all
+                non_ref_sp = sp_coeffs[1][1]
+                delta_bound_all[col] = sp_dd.get(non_ref_sp, 0.0)
 
-            # Pure-species shift of the FREE species:
-            # δ_pure_free = δ_obs(x_free) − Σᵢ Fᵢ_eff(x_free) × Δδᵢ
-            # For guest signals (x_free=0), all Fᵢ(0)=0 → correction=0.
-            # For host signals (x_free>0), correct for the mixture at first point.
+            # Pure-species shifts:
+            # Always stored as dd values (= δ_absolute − δ_obs(V=0)).
+            # Display/export adds δ_obs(V=0) back to recover absolute when
+            # the shift scale is anchored (noref + at least one read:).
+            # ref_corrections[col] is consumed by app.py's back-calc-to-
+            # concentrations machinery. It is defined as
+            #     ref_correction = Σᵢ Fᵢ(x_ref) × ddᵢ   (over ALL species,
+            # including the free / reference species).  In legacy & noref-
+            # without-read modes the normalization above pins dd[ref]=0, so
+            # the ref-species term contributes zero and the sum can be
+            # restricted to non-ref species.  In noref+read mode dd[ref]
+            # may be nonzero — we must include it in the sum.
             x_sim_fp, _ = evaluate_x_expression(x_expr, c_final, parsed)
             denom_at_ref = max(sum(
                 coeff * float(np.interp(x_free_val[col], x_sim_fp,
                               c_final.get(sp, np.zeros_like(x_sim_fp))))
                 for coeff, sp in sp_coeffs), 1e-20)
-            ref_correction = sum(
+            ref_corrections[col] = sum(
                 coeff * float(np.interp(x_free_val[col], x_sim_fp,
                               c_final.get(sp, np.zeros_like(x_sim_fp)))) / denom_at_ref
                 * sp_dd.get(sp, 0.0)
-                for coeff, sp in sp_coeffs[1:]
+                for coeff, sp in sp_coeffs   # all species, incl. ref
             )
-            ref_corrections[col] = ref_correction
-            delta_pure_free = df_exp - ref_correction
-
             if tgt not in pure_shifts:
                 pure_shifts[tgt] = {}
-            pure_shifts[tgt][col] = {sp: delta_pure_free + sp_dd.get(sp, 0.0)
-                                      for _, sp in sp_coeffs}
+            pure_shifts[tgt][col] = dict(sp_dd)
 
     residuals = np.array(all_residuals)
     y_obs     = np.array(all_y_obs)
@@ -575,16 +704,23 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / max(len(residuals), 1)))
 
-    # Parameter errors via finite-difference Hessian (data-only objective, never penalised)
+    # Parameter errors via finite-difference Hessian (data-only objective, never penalised).
+    # Skipped when ``compute_hessian=False`` (bootstrap workers).  Defaults
+    # to empty dict / None placeholders so downstream code that reads
+    # param_errors / param_cov doesn't have to special-case the absence.
     _n_total_params_shift = len(fit_keys) + len(fit_conc_keys) + len(fit_titrant_keys)
-    _err_idx = _hessian_errors(data_objective, result.x, ssr, len(residuals), _n_total_params_shift)
-    param_errors_shift = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
-    for _i in range(len(fit_conc_keys)):
-        _idx = len(fit_keys) + _i
-        if _idx in _err_idx: param_errors_shift[fit_conc_keys[_i]] = _err_idx[_idx]
-    for _i in range(len(fit_titrant_keys)):
-        _idx = len(fit_keys) + len(fit_conc_keys) + _i
-        if _idx in _err_idx: param_errors_shift[fit_titrant_keys[_i]] = _err_idx[_idx]
+    param_errors_shift = {}
+    _cov_mat = None
+    _cov_names_shift = list(fit_keys) + list(fit_conc_keys) + list(fit_titrant_keys)
+    if compute_hessian:
+        _err_idx, _cov_mat = _hessian_errors(data_objective, result.x, ssr, len(residuals), _n_total_params_shift)
+        param_errors_shift = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
+        for _i in range(len(fit_conc_keys)):
+            _idx = len(fit_keys) + _i
+            if _idx in _err_idx: param_errors_shift[fit_conc_keys[_i]] = _err_idx[_idx]
+        for _i in range(len(fit_titrant_keys)):
+            _idx = len(fit_keys) + len(fit_conc_keys) + _i
+            if _idx in _err_idx: param_errors_shift[fit_titrant_keys[_i]] = _err_idx[_idx]
 
     stats = {
         "r_squared":       r2,
@@ -594,7 +730,13 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
         "n_params":        len(fit_keys) + len(fit_conc_keys) + len(fit_titrant_keys),
         "param_values":    fitted_logKs,
         "param_errors":    param_errors_shift,
-        "pure_shifts":     pure_shifts,
+        # Full covariance matrix for the correlation-heatmap and t-test
+        # diagnostics.  ``param_cov_names`` is the row/column order.
+        "param_cov":       _cov_mat,
+        "param_cov_names": _cov_names_shift,
+        "pure_shifts":     pure_shifts,        # dd values (= δ − δ_obs(V=0))
+        "pure_shifts_anchored": bool(_nmr_noref and _read_species),
+        "nmr_noref":             bool(_nmr_noref),
         "delta_vecs_all":  delta_vecs_all,
         "delta_bound_all": delta_bound_all,
         "delta_free":      delta_free,
@@ -609,6 +751,14 @@ def fit_nmr_shifts(parsed: dict, network: dict, nmr_data: dict,
         "sp_concs":        {},      # not used in shift mode; keeps display logic uniform
         "col_to_sp":       {},
         "col_to_nH":       {},
+        # v2 diagnostics — flat residual arrays
+        "y_obs":           np.asarray(y_obs,     dtype=float),
+        "y_calc":          np.asarray(y_obs - residuals, dtype=float),
+        "residuals":       np.asarray(residuals, dtype=float),
+        # v2 bootstrap — per-column arrays for residual resampling
+        "per_col_y_obs":   per_col_y_obs,
+        "per_col_y_calc":  per_col_y_calc,
+        "per_col_x":       per_col_x,
     }
     _to   = stats.get("timed_out", False)
     _r2   = stats.get("r_squared", 0.0)
@@ -684,12 +834,18 @@ def _nmr_integration_backCalc(nmr_data: dict, n_H_list: list, params: dict,
     is_solid     = params.get("titrant_is_solid", False)
 
     # ── Build (col, sp_name, n_H, raw_I, v_add_mL) list ─────────────────────
+    # Species name extraction: a column header may be a real species (e.g. "GH"),
+    # or a $variable name (e.g. "S012"), or a pandas-deduplicated duplicate of
+    # either ("GH.1", "S012.2", …).  Strip the trailing ".N"/"_N" suffix first;
+    # accept the result if it matches a real species OR a known $variable.
+    # If neither, fall back to the column header as a last resort.
+    variables_parsed = parsed.get("variables", {}) or {}
     entries = []
     for idx, col in enumerate(signal_cols):
         sp = re.split(r"[._]\d+$", col)[0]
-        if sp not in all_sp:
+        if sp not in all_sp and sp not in variables_parsed:
             sp = col.split(".")[0]
-        if sp not in all_sp:
+        if sp not in all_sp and sp not in variables_parsed:
             sp = col
         n_H    = float(n_H_list[idx]) if idx < len(n_H_list) else 1.0
         raw_I  = nmr_data[col]["y"]
@@ -797,7 +953,8 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
                         params: dict, logK_vals: dict, fit_keys: list,
                         x_expr: str, tolerance: float, maxiter: int,
                         timeout_s: float = 30.0, constraints=None,
-                   fit_conc_keys=None, fit_titrant_keys=None):
+                   fit_conc_keys=None, fit_titrant_keys=None,
+                   *, compute_hessian: bool = True):
     """
     Fit equilibrium constants to slow-exchange NMR integration data.
 
@@ -832,13 +989,16 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
         return False, {}, {}, "Back-calculation failed"
 
     # Build col→sp and col→n_H maps for statistics output
+    # (Mirrors the species-name extraction in _nmr_integration_backCalc:
+    # accept stripped name if it's a real species OR a known $variable.)
     all_sp   = network["all_species"]
+    _vars    = parsed.get("variables", {}) or {}
     col_to_sp  = {}
     col_to_nH  = {}
     for idx, col in enumerate(signal_cols):
         sp = re.split(r"[._]\d+$", col)[0]
-        if sp not in all_sp: sp = col.split(".")[0]
-        if sp not in all_sp: sp = col
+        if sp not in all_sp and sp not in _vars: sp = col.split(".")[0]
+        if sp not in all_sp and sp not in _vars: sp = col
         col_to_sp[col] = sp
         col_to_nH[col] = float(n_H_list[idx]) if idx < len(n_H_list) else 1.0
 
@@ -892,6 +1052,16 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
     _bounds_conc_nmr    = [_cb_nmr(cn, _x0_conc_nmr[i])    for i, cn in enumerate(fit_conc_keys)]
     _bounds_titrant_nmr = [_tb_nmr(tk, _x0_titrant_nmr[i]) for i, tk in enumerate(fit_titrant_keys)]
 
+    # Per-K soft bounds from the script's 'from X to Y' syntax (defaults if absent).
+    # Honored as a quadratic penalty in objective() since Nelder-Mead ignores `bounds`.
+    _DEFAULT_LO_K, _DEFAULT_HI_K = -2.0, 14.0
+    _eq_by_kname_nmr = {eq["kname"]: eq for eq in parsed.get("equilibria", [])}
+    def _resolve_k_bound_nmr(k, attr, default):
+        v = _eq_by_kname_nmr.get(k, {}).get(attr)
+        return float(v) if v is not None else float(default)
+    _k_lo_nmr = np.array([_resolve_k_bound_nmr(k, "logK_lo", _DEFAULT_LO_K) for k in fit_keys])
+    _k_hi_nmr = np.array([_resolve_k_bound_nmr(k, "logK_hi", _DEFAULT_HI_K) for k in fit_keys])
+
     def _update_bds_nmr(fitted_x):
         """Recentre bounds to ±20% of current fitted values after each pass."""
         for _i, _cn in enumerate(fit_conc_keys):
@@ -903,7 +1073,7 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
 
     def _make_simplex_steps_nmr():
         """Step = full feasible range (hi - lo) per concentration/titrant dim."""
-        k_steps = np.full(_n_k, 1.5)
+        k_steps = np.full(_n_k, (1e-9 if maxiter <= 1 else 1.5))
         c_steps = np.array([_bounds_conc_nmr[i][1]    - _bounds_conc_nmr[i][0]
                             for i in range(_n_c)])
         t_steps = np.array([_bounds_titrant_nmr[i][1] - _bounds_titrant_nmr[i][0]
@@ -951,6 +1121,10 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
         for i, k in enumerate(fit_keys):
             lk[k] = logk_trial[i]
         conc_penalty = 0.0
+        # Penalty for log-K outside per-K bounds
+        for kv, _lo, _hi in zip(logk_trial, _k_lo_nmr, _k_hi_nmr):
+            if kv < _lo: conc_penalty += 1e6 * (kv - _lo) ** 2
+            elif kv > _hi: conc_penalty += 1e6 * (kv - _hi) ** 2
         if fitting_concs:
             n_k = len(fit_keys)
             for i in range(len(fit_conc_keys)):
@@ -1086,6 +1260,10 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
     bc_final = _get_bc(_params_final_integ)
     all_res = []
     all_obs = []
+    # v2: per-species arrays for bootstrap resampling
+    per_col_y_obs   = {}
+    per_col_y_calc  = {}
+    per_col_x       = {}
 
     if c_final is not None:
         x_sim_f, _ = evaluate_x_expression(x_expr, c_final, parsed)
@@ -1093,6 +1271,9 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
             c_th = np.interp(x_bc, x_sim_f, _resolve_c(c_final, sp, parsed, x_sim_f))
             all_res.extend((c_bc - c_th).tolist())
             all_obs.extend(c_bc.tolist())
+            per_col_y_obs[sp]  = np.asarray(c_bc, dtype=float)
+            per_col_y_calc[sp] = np.asarray(c_th, dtype=float)
+            per_col_x[sp]      = np.asarray(x_bc, dtype=float)
 
     residuals = np.array(all_res)
     y_obs_arr = np.array(all_obs)
@@ -1101,18 +1282,22 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / max(len(residuals), 1)))
 
-    # Parameter errors via finite-difference Hessian (data-only objective, never penalised)
+    # Parameter errors via finite-difference Hessian (skipped if compute_hessian=False)
     _bc_final_h = _get_bc(_params_final_integ)
     _n_total_params_integ = len(fit_keys) + len(fit_conc_keys) + len(fit_titrant_keys)
-    _err_idx = _hessian_errors(lambda pv: data_objective(pv, _bc_final_h),
-                               result.x, ssr, len(residuals), _n_total_params_integ)
-    param_errors_integ = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
-    for _i in range(len(fit_conc_keys)):
-        _idx = len(fit_keys) + _i
-        if _idx in _err_idx: param_errors_integ[fit_conc_keys[_i]] = _err_idx[_idx]
-    for _i in range(len(fit_titrant_keys)):
-        _idx = len(fit_keys) + len(fit_conc_keys) + _i
-        if _idx in _err_idx: param_errors_integ[fit_titrant_keys[_i]] = _err_idx[_idx]
+    param_errors_integ = {}
+    _cov_mat = None
+    _cov_names_integ = list(fit_keys) + list(fit_conc_keys) + list(fit_titrant_keys)
+    if compute_hessian:
+        _err_idx, _cov_mat = _hessian_errors(lambda pv: data_objective(pv, _bc_final_h),
+                                   result.x, ssr, len(residuals), _n_total_params_integ)
+        param_errors_integ = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
+        for _i in range(len(fit_conc_keys)):
+            _idx = len(fit_keys) + _i
+            if _idx in _err_idx: param_errors_integ[fit_conc_keys[_i]] = _err_idx[_idx]
+        for _i in range(len(fit_titrant_keys)):
+            _idx = len(fit_keys) + len(fit_conc_keys) + _i
+            if _idx in _err_idx: param_errors_integ[fit_titrant_keys[_i]] = _err_idx[_idx]
 
     # sp_concs format: {sp: [(x_arr, c_bc_arr), ...]}  (list for compatibility)
     sp_concs = {sp: [(x_bc, c_bc)] for sp, (x_bc, c_bc) in bc_final.items()}
@@ -1125,6 +1310,8 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
         "n_params":     len(fit_keys) + len(fit_conc_keys) + len(fit_titrant_keys),
         "param_values": fitted_logKs,
         "param_errors": param_errors_integ,
+        "param_cov":       _cov_mat,
+        "param_cov_names": _cov_names_integ,
         "sp_concs":     sp_concs,
         "col_to_sp":    col_to_sp,
         "col_to_nH":    col_to_nH,
@@ -1140,6 +1327,14 @@ def fit_nmr_integration(parsed: dict, network: dict, nmr_data: dict,
         "x_free_val":      {},
         "col_to_target":   {},
         "ref_corrections": {},
+        # v2 diagnostics — flat residual arrays
+        "y_obs":           np.asarray(y_obs_arr,             dtype=float),
+        "y_calc":          np.asarray(y_obs_arr - residuals, dtype=float),
+        "residuals":       np.asarray(residuals,             dtype=float),
+        # v2 bootstrap — per-species arrays
+        "per_col_y_obs":   per_col_y_obs,
+        "per_col_y_calc":  per_col_y_calc,
+        "per_col_x":       per_col_x,
     }
     _to   = stats.get("timed_out", False)
     _r2   = stats.get("r_squared", 0.0)
@@ -1154,7 +1349,8 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
                   params: dict, logK_vals: dict, fit_keys: list,
                   x_expr: str, tolerance: float, maxiter: int,
                   timeout_s: float = 30.0, constraints=None,
-                   fit_conc_keys=None, fit_titrant_keys=None):
+                   fit_conc_keys=None, fit_titrant_keys=None,
+                   *, compute_hessian: bool = True):
     """
     Fit equilibrium constants to mixed slow+fast exchange NMR data.
 
@@ -1185,6 +1381,7 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
     n_H_list = nmr_cfg.get("n_H_list", [])
     n_integ  = nmr_cfg.get("n_integ", len(n_H_list))
     shift_targets = nmr_cfg.get("targets", [])
+    _shift_constraints = parsed.get("shift_constraints", []) or []
 
     # ── Solid mode: retrieve column-A header ─────────────────────────────────
     _x_col_header = nmr_data.get("_x_col_header", "")
@@ -1199,6 +1396,18 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
 
     if not integ_cols and not shift_cols:
         return False, {}, {}, "No NMR data columns found"
+
+    # ── Per-column shift bounds (the 'shift: -0.8, free, 1.0, ...' syntax) ──
+    _per_col_bounds = get_per_column_bounds(_shift_constraints)
+    _col_to_bound = {}
+    if _per_col_bounds is not None:
+        if len(_per_col_bounds) != len(shift_cols):
+            return False, {}, {}, (
+                f"Per-column shift bounds list has {len(_per_col_bounds)} entries "
+                f"but the data has {len(shift_cols)} shift columns. "
+                f"Use 'free' for columns you don't want to constrain."
+            )
+        _col_to_bound = dict(zip(shift_cols, _per_col_bounds))
 
     # ── Back-calculate concentrations from integration columns (K-independent) ─
     bc = {}
@@ -1224,6 +1433,34 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
         x_arr = convert_exp_x(nmr_data[col]["v_add_mL"], x_expr, parsed, params, network,
                                x_col_header=_x_col_header)
         x_free_val[col] = float(x_arr[0])
+
+    # ── Pinned intrinsic shifts ($nmr 'read:' + sheet-2 known shifts) ─────
+    _read_species  = list(nmr_cfg.get("read", []) or [])
+    _known_shifts  = nmr_data.get("_known_shifts", {}) or {}
+    _col_to_pinned = {}
+    if _read_species:
+        for sp in _read_species:
+            if sp not in _known_shifts:
+                return False, {}, {}, (
+                    f"$nmr 'read: {sp}' but species '{sp}' not found in sheet 2 of "
+                    f"the data file (expected row with '{sp}' in column A and "
+                    f"{len(shift_cols)} chemical-shift values to its right)."
+                )
+            vals = _known_shifts[sp]
+            if len(vals) != len(shift_cols):
+                return False, {}, {}, (
+                    f"$nmr 'read: {sp}': sheet 2 has {len(vals)} values for '{sp}' "
+                    f"but the data has {len(shift_cols)} shift columns. "
+                    f"Provide one value per shift column, in the same order."
+                )
+            for k, col in enumerate(shift_cols):
+                dd_val = float(vals[k]) - float(delta_free[col])
+                _col_to_pinned.setdefault(col, {})[sp] = dd_val
+
+    # noref flag: when True, dd_ref is NOT auto-pinned to 0; instead at least
+    # one read: anchor is required to fix the absolute scale.  Default False
+    # preserves legacy "Δδ relative to ref" behavior so tutorials run unchanged.
+    _nmr_noref = bool(nmr_cfg.get("noref", False))
 
 
     # ── Concentration fitting setup ──────────────────────────────────────────
@@ -1272,6 +1509,16 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
     _bounds_conc_nmr    = [_cb_nmr(cn, _x0_conc_nmr[i])    for i, cn in enumerate(fit_conc_keys)]
     _bounds_titrant_nmr = [_tb_nmr(tk, _x0_titrant_nmr[i]) for i, tk in enumerate(fit_titrant_keys)]
 
+    # Per-K soft bounds from the script's 'from X to Y' syntax (defaults if absent).
+    # Honored as a quadratic penalty in objective() since Nelder-Mead ignores `bounds`.
+    _DEFAULT_LO_K, _DEFAULT_HI_K = -2.0, 14.0
+    _eq_by_kname_nmr = {eq["kname"]: eq for eq in parsed.get("equilibria", [])}
+    def _resolve_k_bound_nmr(k, attr, default):
+        v = _eq_by_kname_nmr.get(k, {}).get(attr)
+        return float(v) if v is not None else float(default)
+    _k_lo_nmr = np.array([_resolve_k_bound_nmr(k, "logK_lo", _DEFAULT_LO_K) for k in fit_keys])
+    _k_hi_nmr = np.array([_resolve_k_bound_nmr(k, "logK_hi", _DEFAULT_HI_K) for k in fit_keys])
+
     def _update_bds_nmr(fitted_x):
         """Recentre bounds to ±20% of current fitted values after each pass."""
         for _i, _cn in enumerate(fit_conc_keys):
@@ -1283,7 +1530,7 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
 
     def _make_simplex_steps_nmr():
         """Step = full feasible range (hi - lo) per concentration/titrant dim."""
-        k_steps = np.full(_n_k, 1.5)
+        k_steps = np.full(_n_k, (1e-9 if maxiter <= 1 else 1.5))
         c_steps = np.array([_bounds_conc_nmr[i][1]    - _bounds_conc_nmr[i][0]
                             for i in range(_n_c)])
         t_steps = np.array([_bounds_titrant_nmr[i][1] - _bounds_titrant_nmr[i][0]
@@ -1341,19 +1588,32 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
                 coeff * float(np.interp(x_free_c, x_sim, c.get(sp, np.zeros_like(x_sim))))
                 for coeff, sp in sp_coeffs), 1e-20)
 
-            non_free = sp_coeffs[1:]
+            # Build full design matrix (all species columns including ref)
             n_pts    = len(x_exp)
-            X = np.zeros((n_pts, len(non_free)))
-            for i, (coeff, sp) in enumerate(non_free):
+            all_target_sp = list(sp_coeffs)
+            X = np.zeros((n_pts, len(all_target_sp)))
+            for i, (coeff, sp) in enumerate(all_target_sp):
                 F_full = coeff * np.interp(x_exp, x_sim, c.get(sp, np.zeros_like(x_sim))) /                          np.maximum(np.interp(x_exp, x_sim, denom_full), 1e-20)
                 F_ref  = coeff * float(np.interp(x_free_c, x_sim,
                          c.get(sp, np.zeros_like(x_sim)))) / denom_ref
                 X[:, i] = F_full - F_ref
 
             dobs_rel = nmr_data[col]["y"] - delta_free[col]
+            _col_bd = _col_to_bound.get(col)
+            _col_pn = _col_to_pinned.get(col)
             if X.shape[1] > 0 and np.any(np.abs(X) > 1e-15):
-                dd = np.linalg.lstsq(X, dobs_rel, rcond=None)[0]
-                residuals = dobs_rel - X @ dd
+                try:
+                    dd, calc, _ssr = solve_shifts(
+                        X, dobs_rel,
+                        [sp for _, sp in all_target_sp], sp_coeffs[0][1],
+                        _shift_constraints,
+                        column_bound=_col_bd, pinned_dd=_col_pn,
+                        noref=_nmr_noref,
+                    )
+                    residuals = dobs_rel - calc
+                except ValueError:
+                    dd = np.linalg.lstsq(X, dobs_rel, rcond=None)[0]
+                    residuals = dobs_rel - X @ dd
             else:
                 residuals = dobs_rel
             total += float(np.sum(residuals**2))
@@ -1372,6 +1632,10 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
         for i, k in enumerate(fit_keys):
             lk[k] = logk_trial[i]
         conc_penalty = 0.0
+        # Penalty for log-K outside per-K bounds
+        for kv, _lo, _hi in zip(logk_trial, _k_lo_nmr, _k_hi_nmr):
+            if kv < _lo: conc_penalty += 1e6 * (kv - _lo) ** 2
+            elif kv > _hi: conc_penalty += 1e6 * (kv - _hi) ** 2
         if fitting_concs:
             n_k = len(fit_keys)
             for i in range(len(fit_conc_keys)):
@@ -1528,6 +1792,9 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
     # Mixing them into one array produces nonsensical R² and RMSE.
     integ_res = []; integ_obs = []
     shift_res = []; shift_obs = []   # stored as Δδ (relative), not absolute ppm
+    # v2: per-source arrays for bootstrap (integration species + shift columns)
+    per_col_y_obs_integ  = {}; per_col_y_calc_integ  = {}; per_col_x_integ  = {}
+    per_col_y_obs_shift  = {}; per_col_y_calc_shift  = {}; per_col_x_shift  = {}
 
     if c_final is not None:
         x_sim_f, _ = evaluate_x_expression(x_expr, c_final, parsed)
@@ -1538,6 +1805,9 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
             c_th = np.interp(x_bc, x_sim_f, _resolve_c(c_final, sp, parsed, x_sim_f))
             integ_res.extend((c_bc - c_th).tolist())
             integ_obs.extend(c_bc.tolist())
+            per_col_y_obs_integ[sp]  = np.asarray(c_bc, dtype=float)
+            per_col_y_calc_integ[sp] = np.asarray(c_th, dtype=float)
+            per_col_x_integ[sp]      = np.asarray(x_bc, dtype=float)
 
         # Shift analytics (Δδ ppm)
         for col in shift_cols:
@@ -1555,19 +1825,31 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
                 coeff * float(np.interp(x_free_c, x_sim_f, c_final.get(sp, np.zeros_like(x_sim_f))))
                 for coeff, sp in sp_coeffs), 1e-20)
 
-            non_free = sp_coeffs[1:]
+            # Build full design matrix (all species columns including ref)
             n_pts    = len(x_exp)
-            X = np.zeros((n_pts, len(non_free)))
-            for i, (coeff, sp) in enumerate(non_free):
+            all_target_sp = list(sp_coeffs)
+            X = np.zeros((n_pts, len(all_target_sp)))
+            for i, (coeff, sp) in enumerate(all_target_sp):
                 F_full = coeff * np.interp(x_exp, x_sim_f, c_final.get(sp, np.zeros_like(x_sim_f))) /                          np.maximum(np.interp(x_exp, x_sim_f, denom_full), 1e-20)
                 F_ref  = coeff * float(np.interp(x_free_c, x_sim_f,
                          c_final.get(sp, np.zeros_like(x_sim_f)))) / denom_ref
                 X[:, i] = F_full - F_ref
 
             dobs_rel = nmr_data[col]["y"] - df0
+            _col_bd = _col_to_bound.get(col)
+            _col_pn = _col_to_pinned.get(col)
             if X.shape[1] > 0:
-                dd = np.linalg.lstsq(X, dobs_rel, rcond=None)[0]
-                calc_rel = X @ dd
+                try:
+                    dd, calc_rel, _ = solve_shifts(
+                        X, dobs_rel,
+                        [sp for _, sp in all_target_sp], sp_coeffs[0][1],
+                        _shift_constraints,
+                        column_bound=_col_bd, pinned_dd=_col_pn,
+                        noref=_nmr_noref,
+                    )
+                except ValueError:
+                    dd = np.linalg.lstsq(X, dobs_rel, rcond=None)[0]
+                    calc_rel = X @ dd
             else:
                 dd = np.array([])
                 calc_rel = np.zeros_like(dobs_rel)
@@ -1575,27 +1857,40 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
             # Use Δδ (relative shifts) — NOT absolute ppm — for statistics
             shift_res.extend((dobs_rel - calc_rel).tolist())
             shift_obs.extend(dobs_rel.tolist())
+            per_col_y_obs_shift[col]  = np.asarray(dobs_rel, dtype=float)
+            per_col_y_calc_shift[col] = np.asarray(calc_rel, dtype=float)
+            per_col_x_shift[col]      = np.asarray(x_exp,    dtype=float)
 
-            free_sp  = sp_coeffs[0][1]
-            sp_dd    = {free_sp: 0.0}
-            for i, (_, sp) in enumerate(non_free):
-                sp_dd[sp] = float(dd[i]) if i < len(dd) else 0.0
+            # In the new convention dd[i] = δ_i_absolute − δ_obs(V=0).
+            # Legacy (no noref): dd[ref] = 0 by auto-pin.  Noref: dd[ref] is fitted.
+            sp_dd = {sp: float(dd[i]) if i < len(dd) else 0.0
+                     for i, (_, sp) in enumerate(all_target_sp)}
+            # Normalize when not anchored (see fit_nmr_shifts for rationale).
+            if not (_nmr_noref and _read_species):
+                ref_sp = sp_coeffs[0][1]
+                ref_dd = sp_dd.get(ref_sp, 0.0)
+                if abs(ref_dd) > 1e-12:
+                    sp_dd = {k: v - ref_dd for k, v in sp_dd.items()}
             delta_vecs_all[col] = sp_dd
             if len(sp_coeffs) == 2:
-                delta_bound_all[col] = float(dd[0]) if len(dd) > 0 else 0.0
+                non_ref_sp = sp_coeffs[1][1]
+                delta_bound_all[col] = sp_dd.get(non_ref_sp, 0.0)
 
-            # Pure-species shifts
-            ref_correction = sum(
+            # Pure-species shifts: stored as dd values (= δ_absolute − δ_obs(V=0)).
+            # Display/export adds δ_obs(V=0) back when the scale is anchored
+            # (noref=True with at least one read: pin).
+            # ref_corrections[col] is defined as Σᵢ Fᵢ(x_ref)·ddᵢ over ALL
+            # species (incl. reference).  In noref+read mode dd[ref] may
+            # be nonzero so the ref species term must be kept.
+            ref_corrections[col] = sum(
                 coeff * float(np.interp(x_free_c, x_sim_f,
                               c_final.get(sp, np.zeros_like(x_sim_f)))) / denom_ref
                 * sp_dd.get(sp, 0.0)
-                for coeff, sp in sp_coeffs[1:])
-            ref_corrections[col] = ref_correction
-            delta_pure_free = df0 - ref_correction
+                for coeff, sp in sp_coeffs   # all species, incl. ref
+            )
             if tgt not in pure_shifts:
                 pure_shifts[tgt] = {}
-            pure_shifts[tgt][col] = {sp: delta_pure_free + sp_dd.get(sp, 0.0)
-                                      for _, sp in sp_coeffs}
+            pure_shifts[tgt][col] = dict(sp_dd)
 
     # ── Per-component statistics ─────────────────────────────────────────────
     def _r2_rmse(res_list, obs_list):
@@ -1618,43 +1913,78 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
     ssr  = ssr_integ + ssr_shift
     rmse = float(np.sqrt(ssr / max(n_total, 1)))   # mixed units — shown separately
 
-    # Parameter errors via finite-difference Hessian of the normalized objective.
+    # v2: combined flat residuals (integration first, then shift)
+    _mixed_yobs = np.asarray(list(integ_obs) + list(shift_obs), dtype=float)
+    _mixed_res  = np.asarray(list(integ_res) + list(shift_res), dtype=float)
+    _mixed_ycalc = _mixed_yobs - _mixed_res
+
+    # Parameter errors via finite-difference Hessian (skipped if compute_hessian=False).
     # For mixed mode the objective is dimensionless (normalized chi-squared), so
     # σ² is just 1/(n-p) — we're already working in units of variance.
     # Use data_objective (no penalty) so constraint curvature doesn't dominate.
     _n_total_params_mixed = len(fit_keys) + len(fit_conc_keys) + len(fit_titrant_keys)
     _bc_final_mixed_h = _get_bc_mixed(_params_final_mixed)
-    _err_idx = _hessian_errors(lambda pv: data_objective(pv, _bc_final_mixed_h),
-                               result.x, ssr, n_total, _n_total_params_mixed)
-    param_errors_mixed = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
-    for _i in range(len(fit_conc_keys)):
-        _idx = len(fit_keys) + _i
-        if _idx in _err_idx: param_errors_mixed[fit_conc_keys[_i]] = _err_idx[_idx]
-    for _i in range(len(fit_titrant_keys)):
-        _idx = len(fit_keys) + len(fit_conc_keys) + _i
-        if _idx in _err_idx: param_errors_mixed[fit_titrant_keys[_i]] = _err_idx[_idx]
+    param_errors_mixed = {}
+    _cov_mat = None
+    _cov_names_mixed = list(fit_keys) + list(fit_conc_keys) + list(fit_titrant_keys)
+    if compute_hessian:
+        _err_idx, _cov_mat = _hessian_errors(lambda pv: data_objective(pv, _bc_final_mixed_h),
+                                   result.x, ssr, n_total, _n_total_params_mixed)
+        param_errors_mixed = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
+        for _i in range(len(fit_conc_keys)):
+            _idx = len(fit_keys) + _i
+            if _idx in _err_idx: param_errors_mixed[fit_conc_keys[_i]] = _err_idx[_idx]
+        for _i in range(len(fit_titrant_keys)):
+            _idx = len(fit_keys) + len(fit_conc_keys) + _i
+            if _idx in _err_idx: param_errors_mixed[fit_titrant_keys[_i]] = _err_idx[_idx]
+
+    # ── Variance-normalized chi²-RMSE for the LST ──────────────────────────
+    # The optimizer minimized the variance-normalized objective
+    # chi² = integ_ssr/integ_var + shift_ssr_raw/shift_var (mixed units
+    # are made comparable by the per-component variance weights).  The
+    # raw `rmse` reported above mixes mM² and ppm² and has its minimum
+    # at a DIFFERENT point than the chi² minimum where the fit lives,
+    # so the local-sensitivity test (which uses paired-difference
+    # geometry that only makes sense at a local minimum of the probed
+    # objective) needs the chi² value, not the raw rmse.  We expose
+    # both: `rmse` stays raw for backward-compat / display, and
+    # `chi2_rmse` is what the LST reads.
+    try:
+        _chi2_final = float(data_objective(result.x, _bc_final_mixed_h))
+        _chi2_rmse  = float(np.sqrt(max(_chi2_final, 0.0) / max(n_total, 1)))
+    except Exception:
+        _chi2_rmse = float(rmse)  # fallback
 
     # Build col_to_sp and col_to_nH for display
+    # (Mirrors the species-name extraction in _nmr_integration_backCalc:
+    # accept stripped name if it's a real species OR a known $variable.)
     all_sp_net = network["all_species"]
+    _vars      = parsed.get("variables", {}) or {}
     col_to_sp = {}; col_to_nH = {}
     for idx, col in enumerate(integ_cols):
         sp = re.split(r"[._]\d+$", col)[0]
-        if sp not in all_sp_net: sp = col.split(".")[0]
+        if sp not in all_sp_net and sp not in _vars: sp = col.split(".")[0]
+        if sp not in all_sp_net and sp not in _vars: sp = col
         col_to_sp[col] = sp
         col_to_nH[col] = float(n_H_list[idx]) if idx < len(n_H_list) else 1.0
 
     stats = {
         "r_squared":       r2,
         "rmse":            rmse,
+        "chi2_rmse":       _chi2_rmse,
         "ssr":             ssr,
         "n_points":        n_total,
         "n_params":        len(fit_keys),
         "param_values":    fitted_logKs,
         "param_errors":    param_errors_mixed,
+        "param_cov":       _cov_mat,
+        "param_cov_names": _cov_names_mixed,
         "sp_concs":        sp_concs,
         "col_to_sp":       col_to_sp,
         "col_to_nH":       col_to_nH,
-        "pure_shifts":     pure_shifts,
+        "pure_shifts":     pure_shifts,        # dd values (= δ − δ_obs(V=0))
+        "pure_shifts_anchored": bool(_nmr_noref and _read_species),
+        "nmr_noref":             bool(_nmr_noref),
         "delta_vecs_all":  delta_vecs_all,
         "delta_bound_all": delta_bound_all,
         "delta_free":      delta_free,
@@ -1673,6 +2003,27 @@ def fit_nmr_mixed(parsed: dict, network: dict, nmr_data: dict,
         "r2_shift":        r2_shift,
         "rmse_shift":      rmse_shift,
         "n_shift_pts":     n_shift_pts,
+        # v2 diagnostics — combined flat residuals (integration block first, shift block second)
+        "y_obs":           _mixed_yobs,
+        "y_calc":          _mixed_ycalc,
+        "residuals":       _mixed_res,
+        # v2 bootstrap — per-source arrays (split for within-block resampling)
+        "per_col_y_obs_integ":  per_col_y_obs_integ,
+        "per_col_y_calc_integ": per_col_y_calc_integ,
+        "per_col_x_integ":      per_col_x_integ,
+        "per_col_y_obs_shift":  per_col_y_obs_shift,
+        "per_col_y_calc_shift": per_col_y_calc_shift,
+        "per_col_x_shift":      per_col_x_shift,
+        # v2 unified per_col_* — what the residuals-vs-predictor scatter
+        # consumes via collect_residuals_from_stats.  Same tagging
+        # scheme as fit_kinetics_nmr_mixed so the legend distinguishes
+        # integration from shift columns.
+        "per_col_x":      {**{f"{c} (int)":   v for c, v in per_col_x_integ.items()},
+                            **{f"{c} (shift)": v for c, v in per_col_x_shift.items()}},
+        "per_col_y_obs":  {**{f"{c} (int)":   v for c, v in per_col_y_obs_integ.items()},
+                            **{f"{c} (shift)": v for c, v in per_col_y_obs_shift.items()}},
+        "per_col_y_calc": {**{f"{c} (int)":   v for c, v in per_col_y_calc_integ.items()},
+                            **{f"{c} (shift)": v for c, v in per_col_y_calc_shift.items()}},
     }
     _r2   = stats.get("r_squared", 0.0)
     _conv = result.success or ssr < 1e-6 or (timed_out and _r2 >= 0.99)

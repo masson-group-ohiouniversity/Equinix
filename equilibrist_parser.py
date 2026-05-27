@@ -399,6 +399,96 @@ def _needs_kspace_eval(expr_str, param_names):
     return bool(re.search(r'(?<![eE])\s*[+-]\s*(?=[^\s])', cleaned[1:]))  # skip leading sign
 
 
+def _parse_shift_constraint_line(line):
+    """
+    Parse one 'shift:' constraint line.  Returns a list with a single dict, or
+    [] for unparseable / empty lines.
+
+    Syntax:
+        shift: A = B = C ...        equality group  → {"type":"shift_eq_group", "species":[...]}
+        shift: A > B > C ...        decreasing chain → {"type":"shift_order", "species":[A,B,C,...]}
+        shift: A < B < C ...        increasing chain → {"type":"shift_order", "species":[C,B,A,...]}
+        shift: 0.8, free, 1.0       per-column bounds → {"type":"shift_per_column_bounds",
+                                                          "values":[0.8, None, 1.0]}
+
+    Per-column bound semantics (symmetric, magnitude-only):
+        a value B means dd is constrained to lie in [-B, +B] for that column,
+        i.e. |dd| <= B. Negative inputs are accepted for backward compatibility
+        but are converted to abs(B) — the sign is determined by the data, not
+        the user.
+
+    The leading 'shift:' (or 'shifts:') keyword must already have been
+    stripped before calling.  Length of the bounds list is *not* validated
+    here (the parser doesn't see the data file); it's checked at fit time.
+    """
+    line = line.strip()
+    if not line:
+        return []
+
+    # Strip optional '; hard' modifier
+    if ';' in line:
+        line = line.split(';', 1)[0].strip()
+
+    # ── Per-column bounds list: comma-separated numbers and/or 'free' ────────
+    # Detect by the presence of a comma. Each comma-separated token must be
+    # either a finite number or the literal "free".
+    if ',' in line:
+        tokens = [t.strip() for t in line.split(',')]
+        if any(t == "" for t in tokens):
+            return []  # trailing or empty comma-separated entry → reject
+        values = []
+        _NUM_RE = re.compile(r'^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$')
+        for t in tokens:
+            if t.lower() == "free":
+                values.append(None)
+            elif _NUM_RE.match(t):
+                # Symmetric magnitude: store abs(value).  Sign in the input is
+                # ignored (legacy scripts may have written negative bounds to
+                # indicate downfield-shifting peaks; with the new symmetric
+                # semantics the sign is determined by data, not the user).
+                values.append(abs(float(t)))
+            else:
+                return []  # unrecognized token → not a valid per-column-bounds line
+        if len(values) < 1:
+            return []
+        return [{"type": "shift_per_column_bounds", "values": values}]
+
+    # ── Equality / inequality chain syntax ───────────────────────────────────
+    OP_RE = re.compile(r'(<=|>=|<|>|==|=)')
+    parts = OP_RE.split(line)
+    if len(parts) < 3:
+        return []
+
+    species = [parts[i].strip() for i in range(0, len(parts), 2)]
+    ops     = [parts[i].strip() for i in range(1, len(parts), 2)]
+
+    if any(not s for s in species):
+        return []
+
+    ops_norm = []
+    for o in ops:
+        if o in ('=', '=='): ops_norm.append('=')
+        elif o in ('<', '<='): ops_norm.append('<')
+        elif o in ('>', '>='): ops_norm.append('>')
+        else: return []
+
+    if len(set(ops_norm)) != 1:
+        return []
+
+    op = ops_norm[0]
+
+    if len(set(species)) != len(species):
+        return []
+
+    if op == '=':
+        return [{"type": "shift_eq_group", "species": species}]
+    if op == '>':
+        return [{"type": "shift_order", "species": species}]
+    if op == '<':
+        return [{"type": "shift_order", "species": list(reversed(species))}]
+    return []
+
+
 def _parse_constraint_line(line, param_names):
     """
     Parse one $constraints line into a list of constraint dicts.
@@ -416,6 +506,11 @@ def _parse_constraint_line(line, param_names):
     line = line.strip()
     if not line or line.startswith('#'):
         return []
+
+    # ── 'shift:' (or 'shifts:') prefix — route to shift-constraint parser ──
+    _m = re.match(r'^shifts?\s*:\s*(.+)$', line, re.IGNORECASE)
+    if _m:
+        return _parse_shift_constraint_line(_m.group(1))
 
     # ── Strip '; hard' modifier ───────────────────────────────────────────
     hard = False
@@ -535,29 +630,49 @@ def constraints_penalty(constraints, logK_dict, ssr_scale: float = 1.0):
     """
     Compute total penalty for all violated constraints.
 
-    Weights scale with ssr_scale so the penalty is always commensurate with
-    the data objective regardless of units (mM², AU², ppm², …).
+    Formulation
+    ───────────
+    Plain quadratic penalties (W·val²) make the simplex methods used here
+    impossible to optimize when the simplex step is large compared to the
+    constraint precision: a single test vertex at violation ≈ 1.5 log-units
+    gives penalty W·2.25 = 225 000 × SSR_scale, which dwarfs the data signal
+    and forces every simplex move to be rejected.
 
-    Target: penalty ≈ 1000 × ssr_scale when constraint violated by 0.1 log units.
-    → W = 1000 × ssr_scale / (0.1)² = 100 000 × ssr_scale
+    To enforce the constraint without crushing the simplex, we use a
+    quadratic-then-linear penalty (a "Huberised" form):
 
-    Hard constraints use W × 1000.
+        f(v) = W * v²            for |v| ≤ v0     (quadratic near satisfied)
+        f(v) = W * v0 * (2|v|-v0)  for |v| > v0   (linear for big violations)
 
-    Log-space constraint f = Σ(aᵢ·logKᵢ) + c:
-        '<' penalty: W * max(0,  f)²
-        '>' penalty: W * max(0, -f)²
-        '=' penalty: W * f²
+    With v0 = 0.1, the quadratic regime gives the same gradient as before
+    near the constraint surface (so satisfied constraints behave identically),
+    but for a 1.5-log-unit excursion the penalty grows linearly:
+       f(1.5) = 1e5·SSR × 0.1·(2·1.5 - 0.1) = 1e5·SSR × 0.29 = 29 000·SSR
+    instead of the destructive 225 000·SSR.  Even 29 000·SSR is enormous
+    relative to the data, so Nelder-Mead still strongly prefers points
+    closer to the constraint surface, but the gradient information at the
+    starting point survives and the simplex can explore.
 
-    K-space constraint: evaluate lhs and rhs in linear space,
-        f = (lhs - rhs) / max(|rhs|, 1e-30)   (relative deviation)
-    then same penalty formula.
+    Hard constraints retain a stronger weight (×1000) so they dominate.
+
+    Returns
+    ───────
+    Total penalty, a non-negative float.
     """
     if not constraints:
         return 0.0
 
     _scale = max(abs(ssr_scale), 1e-30)
-    W_SOFT = _scale * 1e5    # ×100 000 so 0.1-unit violation → 1000× SSR
+    W_SOFT = _scale * 1e5
     W_HARD = _scale * 1e8
+    V0     = 0.1   # cross-over from quadratic to linear penalty
+
+    def _huber(W, v):
+        a = abs(v)
+        if a <= V0:
+            return W * v * v
+        else:
+            return W * V0 * (2.0 * a - V0)
 
     penalty = 0.0
     for c in constraints:
@@ -580,12 +695,12 @@ def constraints_penalty(constraints, logK_dict, ssr_scale: float = 1.0):
         op = c["op"]
         if op == '<':
             if val > 0:
-                penalty += W * val * val
+                penalty += _huber(W, val)
         elif op == '>':
             if val < 0:
-                penalty += W * val * val
+                penalty += _huber(W, val)
         else:
-            penalty += W * val * val
+            penalty += _huber(W, val)
 
     return penalty
 
@@ -610,6 +725,7 @@ def parse_script(text: str) -> dict:
         "nmr":              None,   # None | {"mode": "shift"|"integration", "targets": [str]}
         "spectra":          None,   # None | {"transparent": [str]}
         "constraints":      [],     # parsed constraint objects (populated after knames known)
+        "shift_constraints": [],    # parsed shift-equality / shift-order objects (populated after species known)
         "temperature_K":    298.15, # default 298.15 K; overridden by $temperature section
         "warnings":         [],     # non-fatal issues collected during parsing
         "is_acid_base":     False,  # True when $reactions acid-base section is used
@@ -1010,15 +1126,30 @@ def parse_script(text: str) -> dict:
             # "shift: Gtot"           -> fast-exchange chemical shift mode
             # "integration: 1, 3, 1"  -> slow-exchange integration mode
             # Both lines together     -> mixed slow+fast exchange mode
+            # "read: GH2, GH3"        -> species whose intrinsic shifts are
+            #                            taken from a second sheet of the data file
+            # "noref"                 -> do not auto-pin the reference species
+            #                            to dd = 0; require a read: anchor and
+            #                            report absolute shifts
             m_shift = re.match(r"shift\s*:\s*(.+)", line, re.IGNORECASE)
             m_integ = re.match(r"integration\s*:\s*(.+)", line, re.IGNORECASE)
+            m_read  = re.match(r"read\s*:\s*(.*)$",     line, re.IGNORECASE)
+            m_noref = re.match(r"noref\s*$",            line, re.IGNORECASE)
             if m_shift:
                 targets = [t.strip() for t in m_shift.group(1).split(",") if t.strip()]
                 if result["nmr"] is None:
                     result["nmr"] = {"mode": "shift", "targets": targets,
-                                     "n_H_list": [], "n_integ": 0}
+                                     "n_H_list": [], "n_integ": 0,
+                                     "read": [], "noref": False}
                 else:
-                    result["nmr"]["mode"]    = "mixed"
+                    # If mode is None (only noref/read were seen so far), this is
+                    # the first shift/integ directive → set "shift", not "mixed".
+                    # If mode is already "integration", this becomes "mixed".
+                    cur = result["nmr"].get("mode")
+                    if cur in (None, "shift"):
+                        result["nmr"]["mode"] = "shift"
+                    else:
+                        result["nmr"]["mode"] = "mixed"
                     result["nmr"]["targets"] = targets
             elif m_integ:
                 parts    = [t.strip() for t in m_integ.group(1).split(",") if t.strip()]
@@ -1028,11 +1159,37 @@ def parse_script(text: str) -> dict:
                     except ValueError: pass
                 if result["nmr"] is None:
                     result["nmr"] = {"mode": "integration", "n_H_list": n_H_list,
-                                     "n_integ": len(n_H_list), "targets": []}
+                                     "n_integ": len(n_H_list), "targets": [],
+                                     "read": [], "noref": False}
                 else:
-                    result["nmr"]["mode"]     = "mixed"
+                    cur = result["nmr"].get("mode")
+                    if cur in (None, "integration"):
+                        result["nmr"]["mode"] = "integration"
+                    else:
+                        result["nmr"]["mode"] = "mixed"
                     result["nmr"]["n_H_list"] = n_H_list
                     result["nmr"]["n_integ"]  = len(n_H_list)
+            elif m_read:
+                raw = m_read.group(1).strip()
+                read_sp = [s.strip() for s in raw.split(",") if s.strip()] if raw else []
+                if result["nmr"] is None:
+                    # Initialise minimal nmr dict; mode will be set when shift:/integration: appears
+                    result["nmr"] = {"mode": None, "targets": [], "n_H_list": [],
+                                     "n_integ": 0, "read": read_sp, "noref": False}
+                else:
+                    # Accumulate across multiple read: lines (last-wins per species)
+                    existing = list(result["nmr"].get("read", []))
+                    seen = set(existing)
+                    for s in read_sp:
+                        if s not in seen:
+                            existing.append(s); seen.add(s)
+                    result["nmr"]["read"] = existing
+            elif m_noref:
+                if result["nmr"] is None:
+                    result["nmr"] = {"mode": None, "targets": [], "n_H_list": [],
+                                     "n_integ": 0, "read": [], "noref": True}
+                else:
+                    result["nmr"]["noref"] = True
 
         elif section == "spectra":
             # "transparent: H, X"  → species with zero absorbance everywhere
@@ -1218,9 +1375,45 @@ def parse_script(text: str) -> dict:
             try:
                 _cs = _parse_constraint_line(_cline, _all_param_names)
                 if _cs:
-                    result["constraints"].extend(_cs)
+                    for _c in _cs:
+                        if _c.get("type") in ("shift_eq_group", "shift_order",
+                                              "shift_per_column_bounds"):
+                            result["shift_constraints"].append(_c)
+                        else:
+                            result["constraints"].append(_c)
             except Exception:
                 pass  # silently skip unparseable lines in fast parse
+
+        # ── Validate shift-constraint species names against the network ──────
+        # Build the species universe from equilibria + kinetics products + initial
+        # species in $concentrations, so we can flag typos early.
+        _all_species = set(result.get("concentrations", {}).keys())
+        _all_species |= {n[:-1] if n.endswith("0") else n for n in _all_species}
+        for _rxn in (result["equilibria"] + result["kinetics"]):
+            for _side in ("reactants", "products"):
+                for _, _sp in _rxn.get(_side, []) or []:
+                    _all_species.add(_sp)
+        # Strip out clearly invalid entries (unknown species), warn on each
+        _valid_shift = []
+        for _sc in result["shift_constraints"]:
+            # Per-column-bounds entries have no species names — keep as-is
+            if _sc.get("type") == "shift_per_column_bounds":
+                _valid_shift.append(_sc)
+                continue
+            _missing = [s for s in _sc["species"] if s not in _all_species]
+            if _missing:
+                result["warnings"].append(
+                    f"shift constraint references unknown species "
+                    f"{_missing} — line: shift: {' '.join(_sc['species'])}"
+                )
+                # Keep only known species; drop the constraint if fewer than 2 remain
+                _kept = [s for s in _sc["species"] if s in _all_species]
+                if len(_kept) >= 2:
+                    _sc["species"] = _kept
+                    _valid_shift.append(_sc)
+            else:
+                _valid_shift.append(_sc)
+        result["shift_constraints"] = _valid_shift
 
     return result
 
@@ -1532,18 +1725,26 @@ def check_script_syntax(text: str) -> list:
 
         # ── $nmr ─────────────────────────────────────────────────────
         elif section == "nmr":
-            m = _re.match(r"^(shift|integration)\s*:\s*(.*)$", line, _re.IGNORECASE)
-            if not m:
-                err(lineno, raw_line, "Expected: shift: TargetName  or  integration: n1, n2, …")
+            # Bare 'noref' line: allowed, no validation needed
+            if _re.match(r"^noref\s*$", line, _re.IGNORECASE):
+                pass
             else:
-                key, val = m.group(1).lower(), m.group(2).strip()
-                if key == "integration" and val:
-                    for tok in [t.strip() for t in val.split(",") if t.strip()]:
-                        if not is_number(tok):
-                            err(lineno, raw_line, f"integration: expects numbers separated by commas; '{tok}' is not a valid number.")
-                elif key == "shift" and val:
-                    for _name in [t.strip() for t in val.split(",") if t.strip()]:
-                        nmr_shift_refs.append((lineno, raw_line, _name))
+                m = _re.match(r"^(shift|integration|read)\s*:\s*(.*)$", line, _re.IGNORECASE)
+                if not m:
+                    err(lineno, raw_line,
+                        "Expected: shift: TargetName  or  integration: n1, n2, …  "
+                        "or  read: Sp1, Sp2, …  or  noref")
+                else:
+                    key, val = m.group(1).lower(), m.group(2).strip()
+                    if key == "integration" and val:
+                        for tok in [t.strip() for t in val.split(",") if t.strip()]:
+                            if not is_number(tok):
+                                err(lineno, raw_line, f"integration: expects numbers separated by commas; '{tok}' is not a valid number.")
+                    elif key == "shift" and val:
+                        for _name in [t.strip() for t in val.split(",") if t.strip()]:
+                            nmr_shift_refs.append((lineno, raw_line, _name))
+                    # 'read' species names: validated against the network species at
+                    # parser end (same path as shift_constraints), no syntax error here.
 
         # ── $spectra ──────────────────────────────────────────────────
         elif section == "spectra":

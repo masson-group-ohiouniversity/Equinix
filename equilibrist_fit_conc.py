@@ -45,13 +45,18 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                    tolerance=1e-6, maxiter=100_000,
                    use_lbfgsb=True, use_neldermead=True,
                    constraints=None,
-                   fit_conc_keys=None, fit_titrant_keys=None):
+                   fit_conc_keys=None, fit_titrant_keys=None,
+                   *, compute_hessian: bool = True):
     """
     Fit selected log K / rate constants (and optionally concentrations/titrant) to
     experimental data.
 
     fit_conc_keys   : list of concentration root names to fit (e.g. ['G'])
     fit_titrant_keys: list of titrant keys to fit (e.g. ['Mt'])
+    compute_hessian : if False, skip the finite-difference Hessian at the
+                      end of the fit (faster for bootstrap iterations that
+                      only need the fitted parameter values, not their
+                      uncertainties).  Default True for normal use.
 
     Returns (success, fitted_logKs, stats, message).
     stats['fitted_concs']    -> {root: mM}
@@ -96,8 +101,14 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
             x0_titrant.append(params["titrant_mMs"].get(tfree, 10.0))
         x0 = np.array(x0_logK + x0_conc + x0_titrant, dtype=float)
 
-        # bounds
-        bounds_logK = [(LOGK_MIN, LOGK_MAX)] * len(logK_names)
+        # bounds (per-K from the script's "from X to Y", default to LOGK_MIN/MAX)
+        _eq_by_kname_conc = {eq["kname"]: eq for eq in parsed.get("equilibria", [])}
+        def _resolve_k_bound_conc(k, attr, default):
+            v = _eq_by_kname_conc.get(k, {}).get(attr)
+            return float(v) if v is not None else float(default)
+        bounds_logK = [(_resolve_k_bound_conc(k, "logK_lo", LOGK_MIN),
+                        _resolve_k_bound_conc(k, "logK_hi", LOGK_MAX))
+                       for k in logK_names]
 
         # Map root → original cname (e.g. 'G' → 'G0') for conc_bounds lookup
         _root_to_cname = {}
@@ -140,7 +151,7 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
             bounds = bounds_logK + bounds_conc + bounds_titrant
 
         def _make_simplex_steps_fp():
-            k_steps = np.full(n_logK, 1.5)
+            k_steps = np.full(n_logK, (1e-9 if maxiter <= 1 else 1.5))
             c_steps = np.array([bounds_conc[i][1]    - bounds_conc[i][0]
                                 for i in range(n_conc)])
             t_steps = np.array([bounds_titrant[i][1] - bounds_titrant[i][0]
@@ -252,7 +263,7 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                                      'adaptive': True,
                                      'initial_simplex': simplex})
 
-        _logk_steps = np.full(n_logK, 1.5)
+        _logk_steps = np.full(n_logK, (1e-9 if maxiter <= 1 else 1.5))
         result      = None
         best_x      = x0.copy()
 
@@ -330,6 +341,12 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                 fin_parsed = parsed
 
             final_res, theo_vals, exp_vals = [], [], []
+            # v2: per-column arrays so the residual diagnostic plot can
+            # use the actual x_expr-converted titration coordinate (e.g.
+            # "H0/G0") instead of falling back to 0..N-1 indices.
+            _per_col_x  = {}
+            _per_col_yo = {}
+            _per_col_yc = {}
             for v_add, exp_y, exp_col in exp_points:
                 try:
                     x_val = convert_exp_x(np.array([v_add]), x_expr,
@@ -342,11 +359,19 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                         final_res.append((exp_y - theo)**2)
                         theo_vals.append(theo)
                         exp_vals.append(exp_y)
+                        # Group per column for the diagnostic scatter
+                        _per_col_x .setdefault(exp_col, []).append(float(x_val))
+                        _per_col_yo.setdefault(exp_col, []).append(float(exp_y))
+                        _per_col_yc.setdefault(exp_col, []).append(float(theo))
                 except Exception:
                     continue
 
             if not final_res:
                 return False, {}, {}, "No valid residuals for statistics"
+
+            _exp_arr  = np.asarray(exp_vals,  dtype=float)
+            _theo_arr = np.asarray(theo_vals, dtype=float)
+            _res_arr  = _exp_arr - _theo_arr
 
             ssr  = float(np.sum(final_res))
             rmse = float(np.sqrt(ssr / len(final_res)))
@@ -366,9 +391,26 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                 "param_values":    {},
                 "fitted_concs":    conc_fit,
                 "fitted_titrants": tit_fit,
+                "fit_mode":        "conc",
+                # v2 diagnostics — flat residual arrays for AIC/bootstrap
+                "y_obs":           _exp_arr,
+                "y_calc":          _theo_arr,
+                "residuals":       _res_arr,
+                # v2 per-column arrays for the diagnostic scatter and
+                # the bootstrap's within-column resampling — same layout
+                # as the NMR/spectra modules already use.
+                "per_col_x":       {k: np.asarray(v, dtype=float)
+                                    for k, v in _per_col_x.items()},
+                "per_col_y_obs":   {k: np.asarray(v, dtype=float)
+                                    for k, v in _per_col_yo.items()},
+                "per_col_y_calc":  {k: np.asarray(v, dtype=float)
+                                    for k, v in _per_col_yc.items()},
             }
 
-            # Hessian-based uncertainties (data-only)
+            # Hessian-based uncertainties (data-only).  Skipped when
+            # the caller has set ``compute_hessian=False`` (e.g.
+            # bootstrap workers that only need the fitted parameter
+            # values — saves ~1 + 2n² objective evaluations per fit).
             def raw_rvec(fp):
                 lgk, cd, td = _unpack(fp)
                 lk = logK_vals.copy(); lk.update(lgk)
@@ -389,28 +431,36 @@ def fit_parameters(parsed, network, exp_data, params, logK_vals, fit_keys, x_exp
                         res.append(0.0)
                 return np.array(res)
 
-            try:
-                if n_pts > n_par:
-                    r0  = raw_rvec(best_x)
-                    eps = 1e-4
-                    J   = np.zeros((n_pts, n_par))
-                    for k in range(n_par):
-                        dx = np.zeros(n_par); dx[k] = eps
-                        J[:, k] = (raw_rvec(best_x + dx) - r0) / eps
-                    sigma2 = float(np.dot(r0, r0)) / (n_pts - n_par)
-                    JtJ = J.T @ J
-                    try:
-                        cov = np.linalg.inv(JtJ) * sigma2
-                    except np.linalg.LinAlgError:
-                        d = np.diag(JtJ)
-                        cov = np.diag(np.where(d > 0, sigma2/d, 0.0))
-                    all_names = logK_names + conc_names + titrant_names
-                    stats["param_errors"] = {
-                        all_names[k]: float(np.sqrt(max(cov[k,k], 0.0)))
-                        for k in range(n_par)
-                    }
-            except Exception:
-                pass
+            if compute_hessian:
+                try:
+                    if n_pts > n_par:
+                        r0  = raw_rvec(best_x)
+                        eps = 1e-4
+                        J   = np.zeros((n_pts, n_par))
+                        for k in range(n_par):
+                            dx = np.zeros(n_par); dx[k] = eps
+                            J[:, k] = (raw_rvec(best_x + dx) - r0) / eps
+                        sigma2 = float(np.dot(r0, r0)) / (n_pts - n_par)
+                        JtJ = J.T @ J
+                        try:
+                            cov = np.linalg.inv(JtJ) * sigma2
+                        except np.linalg.LinAlgError:
+                            d = np.diag(JtJ)
+                            cov = np.diag(np.where(d > 0, sigma2/d, 0.0))
+                        all_names = logK_names + conc_names + titrant_names
+                        stats["param_errors"] = {
+                            all_names[k]: float(np.sqrt(max(cov[k,k], 0.0)))
+                            for k in range(n_par)
+                        }
+                        # Store full covariance for the correlation heatmap
+                        # and t-test diagnostics.  Same convention as the
+                        # NMR/kinetics modules: ``param_cov`` is the n×n
+                        # numpy array; ``param_cov_names`` is the row/col
+                        # order matching the array.
+                        stats["param_cov"]       = np.asarray(cov, dtype=float)
+                        stats["param_cov_names"] = list(all_names)
+                except Exception:
+                    pass
 
             for k, pname in enumerate(logK_names):
                 stats["param_values"][pname] = float(best_x[k])

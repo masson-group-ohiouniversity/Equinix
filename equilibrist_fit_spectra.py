@@ -233,7 +233,8 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
                 auto_range: bool = False, timeout_s: float = 30.0,
                 constraints=None,
                 fit_conc_keys=None, fit_titrant_keys=None,
-                allow_negative_eps: bool = False):
+                allow_negative_eps: bool = False,
+                *, compute_hessian: bool = True):
     """
     Fit equilibrium constants to UV-Vis absorbance data using Beer-Lambert law.
 
@@ -623,7 +624,7 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
                 full = np.concatenate([lk_vec, x0[n_k:]])
                 return objective(full)
             _sp1_sf = np.vstack([x0[:n_k]] +
-                                [x0[:n_k] + np.eye(n_k)[i]*1.5 for i in range(n_k)])
+                                [x0[:n_k] + np.eye(n_k)[i] * (1e-9 if maxiter <= 1 else 1.5) for i in range(n_k)])
             try:
                 _r1_sf = minimize(_phase1_obj_spfit, x0[:n_k], method="Nelder-Mead",
                                   options={"maxiter": maxiter//2,
@@ -675,7 +676,8 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
         # ── Stage 2: Nelder-Mead (always runs, warm-started if BFGS helped) ──
         init_simplex = np.vstack([x0] +
                                   [x0 + np.eye(n_p)[i] * (
-                                      1.5 if i < len(fit_keys)
+                                      (1e-9 if maxiter <= 1 else 1.5)
+                                       if i < len(fit_keys)
                                       else max(abs(x0[i]) * 0.1, 0.05))
                                    for i in range(n_p)])
         try:
@@ -792,8 +794,12 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
         E = _solve_E(C, A_fit_f, _known_f)
         return float(np.sum((A_fit_f - C @ E) ** 2))
 
-    _err_idx     = _hessian_errors(_obj_final, result1.x, ssr, len(residuals), len(fit_keys))
-    param_errors = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
+    param_errors = {}
+    _cov_mat = None
+    _cov_names_spec = list(fit_keys)
+    if compute_hessian:
+        _err_idx, _cov_mat = _hessian_errors(_obj_final, result1.x, ssr, len(residuals), len(fit_keys))
+        param_errors = {fit_keys[i]: _err_idx[i] for i in range(len(fit_keys)) if i in _err_idx}
 
     stats = {
         "r_squared":       r2,
@@ -803,6 +809,8 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
         "n_params":        len(fit_keys),
         "param_values":    fitted_logKs,
         "param_errors":    param_errors,
+        "param_cov":       _cov_mat,
+        "param_cov_names": _cov_names_spec,
         "fitted_concs":    fitted_concs_sp,
         "fitted_titrants": fitted_titrants_sp,
         "fit_mode":        "spectra",
@@ -821,6 +829,14 @@ def fit_spectra(parsed: dict, network: dict, spectra_data: dict,
         "sp_concs": {}, "col_to_sp": {}, "col_to_nH": {},
         "pure_shifts": {}, "delta_vecs_all": {}, "delta_bound_all": {},
         "delta_free": {}, "x_free_val": {}, "col_to_target": {}, "ref_corrections": {},
+        # ── v2: expose absorbance matrices so bootstrap_spectra and
+        # collect_residuals_spectra can find them ────────────────────────
+        "A_obs":           A_fit_f,
+        "A_calc":          A_calc_final,
+        # v2 diagnostics — flat residual arrays
+        "y_obs":     np.asarray(A_fit_f.ravel(),     dtype=float),
+        "y_calc":    np.asarray(A_calc_final.ravel(), dtype=float),
+        "residuals": np.asarray((A_fit_f - A_calc_final).ravel(), dtype=float),
     }
     # ── Identifiability analysis via concentration matrix condition ────────
     timed_out = getattr(result1, "_timed_out", False)

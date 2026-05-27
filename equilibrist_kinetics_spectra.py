@@ -21,7 +21,8 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
                          timeout_s: float = 30.0, auto_range: bool = False,
                          use_lbfgsb: bool = True, use_neldermead: bool = True,
                          constraints=None, fit_conc_keys=None,
-                         allow_negative_eps: bool = False):
+                         allow_negative_eps: bool = False,
+                         *, compute_hessian: bool = True):
     """
     Fit rate constants to UV-Vis kinetics spectra using Beer-Lambert law.
 
@@ -233,9 +234,18 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
                     "start": time.time(), "timed_out": False}
 
     # ── Stage 1: L-BFGS-B (timeout-free, warm-starts Nelder-Mead) ────────
-    # log k is unbounded in principle; use loose bounds to keep solver stable
-    _k_lo = np.concatenate([np.full(_n_k, -6.0), np.array([b[0] for b in _bds_c])])
-    _k_hi = np.concatenate([np.full(_n_k,  9.0), np.array([b[1] for b in _bds_c])])
+    # Per-K bounds from the script's "from X to Y" syntax; loose defaults if absent.
+    _DEFAULT_LO_K, _DEFAULT_HI_K = -6.0, 9.0
+    _eq_by_kname_ks = {eq["kname"]: eq for eq in parsed.get("equilibria", [])}
+    _eq_by_kname_ks.update({rxn.get("kname"):  rxn for rxn in parsed.get("kinetics", []) if rxn.get("kname")})
+    _eq_by_kname_ks.update({rxn.get("krname"): rxn for rxn in parsed.get("kinetics", []) if rxn.get("krname")})
+    def _resolve_k_bound_ks(k, attr, default):
+        v = _eq_by_kname_ks.get(k, {}).get(attr)
+        return float(v) if v is not None else float(default)
+    _k_lo_user = np.array([_resolve_k_bound_ks(k, "logK_lo", _DEFAULT_LO_K) for k in fit_keys])
+    _k_hi_user = np.array([_resolve_k_bound_ks(k, "logK_hi", _DEFAULT_HI_K) for k in fit_keys])
+    _k_lo = np.concatenate([_k_lo_user, np.array([b[0] for b in _bds_c])])
+    _k_hi = np.concatenate([_k_hi_user, np.array([b[1] for b in _bds_c])])
     bounds = list(zip(_k_lo.tolist(), _k_hi.tolist()))
 
     def objective_safe(logk_trial):
@@ -275,7 +285,7 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
             raise _Timeout()
         return f
 
-    _steps = np.array([1.5] * _n_k + [max(abs(_x0_c[i]) * 0.1, 0.05)
+    _steps = np.array([(1e-9 if maxiter <= 1 else 1.5)] * _n_k + [max(abs(_x0_c[i]) * 0.1, 0.05)
                        for i in range(_n_c)])
     init_simplex = np.vstack([x0] + [x0 + np.eye(n_p)[i] * _steps[i]
                                      for i in range(n_p)])
@@ -362,13 +372,16 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
     r2_conc   = float(1.0 - np.sum(_c_res ** 2) / max(_c_sst, 1e-30))
     rmse_conc = float(np.sqrt(np.sum(_c_res ** 2) / max(len(_c_res), 1)))
 
-    _err_idx     = _hessian_errors(data_objective, result.x, ssr, len(residuals), n_p)
     param_errors = {}
-    for _i in range(min(len(fit_keys), n_p)):
-        if _i in _err_idx: param_errors[fit_keys[_i]] = _err_idx[_i]
-    for _i in range(len(fit_conc_keys)):
-        _idx = len(fit_keys) + _i
-        if _idx in _err_idx: param_errors[fit_conc_keys[_i]] = _err_idx[_idx]
+    _cov_mat = None
+    _cov_names_kspec = list(fit_keys) + list(fit_conc_keys)
+    if compute_hessian:
+        _err_idx, _cov_mat = _hessian_errors(data_objective, result.x, ssr, len(residuals), n_p)
+        for _i in range(min(len(fit_keys), n_p)):
+            if _i in _err_idx: param_errors[fit_keys[_i]] = _err_idx[_i]
+        for _i in range(len(fit_conc_keys)):
+            _idx = len(fit_keys) + _i
+            if _idx in _err_idx: param_errors[fit_conc_keys[_i]] = _err_idx[_idx]
 
     _r2_ok = r2 >= 0.99
     if timed_out and _r2_ok:
@@ -383,7 +396,10 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
         "n_params":        n_p,
         "param_values":    fitted_logks,
         "param_errors":    param_errors,
+        "param_cov":       _cov_mat,
+        "param_cov_names": _cov_names_kspec,
         "fit_mode":        "kinetics_spectra",
+        "is_kinetics":     True,
         "n_iter":          getattr(result, "nit", 0),
         "timed_out":       timed_out,
         "r2_conc":         r2_conc,
@@ -401,5 +417,11 @@ def fit_kinetics_spectra(parsed: dict, logk_dict: dict, spectra_data: dict,
         "pure_shifts": {}, "delta_vecs_all": {}, "delta_bound_all": {},
         "delta_free": {}, "x_free_val": {}, "col_to_target": {}, "ref_corrections": {},
         "fitted_concs":    fitted_concs_k, "fitted_titrants": {},
+        # v2 diagnostics — flat residuals (raveled absorbance matrix) + 2-D copies
+        "y_obs":     np.asarray(A_fit.ravel(),  dtype=float),
+        "y_calc":    np.asarray(A_calc.ravel(), dtype=float),
+        "residuals": np.asarray(residuals,      dtype=float),
+        "A_obs":     A_fit,
+        "A_calc":    A_calc,
     }
     return _conv, fitted_logks, stats, "Kinetics UV-Vis spectra fit complete"

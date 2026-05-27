@@ -219,7 +219,8 @@ def compute_kinetics_curve(parsed: dict, logk_dict: dict, t_max: float, n_pts: i
 
 def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
                  t_max: float, n_pts: int, tolerance: float, maxiter: int,
-                 timeout_s: float = 30.0, constraints=None, fit_conc_keys=None):
+                 timeout_s: float = 30.0, constraints=None, fit_conc_keys=None,
+                 *, compute_hessian: bool = True):
     """
     Fit selected log10(k) values to experimental kinetic data.
     exp_data format: {species_name: {"v_add_mL": t_array, "y": y_array}}
@@ -308,6 +309,15 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
         except Exception:
             return None
 
+    # Per-K soft bounds: read from equilibria entries in mixed eq+kinetics scripts
+    _DEFAULT_LO_K_KIN, _DEFAULT_HI_K_KIN = -2.0, 14.0
+    _eq_by_kname_kin = {eq["kname"]: eq for eq in parsed.get("equilibria", [])}
+    def _resolve_k_bound_kin(k, attr, default):
+        v = _eq_by_kname_kin.get(k, {}).get(attr)
+        return float(v) if v is not None else float(default)
+    _k_lo_kin = np.array([_resolve_k_bound_kin(k, "logK_lo", _DEFAULT_LO_K_KIN) for k in fit_names])
+    _k_hi_kin = np.array([_resolve_k_bound_kin(k, "logK_hi", _DEFAULT_HI_K_KIN) for k in fit_names])
+
     def objective(params_vec):
         lk_vec, conc_d = _unpack_concs(params_vec)
         lk = dict(logk_dict)
@@ -317,6 +327,10 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
         if curve is None:
             return 1e12
         penalty = sum(max(0, abs(p) - 12) ** 2 for p in params_vec) * 0.1
+        # Per-K bounds penalty
+        for kv, _lo, _hi in zip(lk_vec, _k_lo_kin, _k_hi_kin):
+            if kv < _lo: penalty += 1e6 * (kv - _lo) ** 2
+            elif kv > _hi: penalty += 1e6 * (kv - _hi) ** 2
         residuals = []
         for t_val, y_val, col in exp_points:
             if col in curve:
@@ -361,7 +375,7 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
             pass
         best_tracker["start"] = time.time()  # reset timer after Phase 1
 
-    _steps = np.array([1.5] * _n_k + [max(abs(_x0_c[i]) * 0.1, 0.05)
+    _steps = np.array([(1e-9 if maxiter <= 1 else 1.5)] * _n_k + [max(abs(_x0_c[i]) * 0.1, 0.05)
                        for i in range(_n_c)])
     init_simplex = np.vstack([x0] + [x0 + np.eye(n_p)[i] * _steps[i]
                                      for i in range(n_p)])
@@ -386,11 +400,19 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
     curve = _simulate(result.x)
     residuals = []
     y_obs = []
+    # v2: per-column arrays — for kinetics, x = time so residuals can
+    # be plotted vs t (in seconds) instead of 0..N-1 indices.
+    _per_col_t  = {}
+    _per_col_yo = {}
+    _per_col_yc = {}
     for t_val, y_val, col in exp_points:
         if curve is not None and col in curve:
             y_sim = np.interp(t_val, curve["t"], curve[col])
             residuals.append(y_sim - y_val)
             y_obs.append(y_val)
+            _per_col_t .setdefault(col, []).append(float(t_val))
+            _per_col_yo.setdefault(col, []).append(float(y_val))
+            _per_col_yc.setdefault(col, []).append(float(y_sim))
     residuals = np.array(residuals)
     y_obs     = np.array(y_obs)
     ssr  = float(np.sum(residuals ** 2))
@@ -398,30 +420,36 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
     r2   = 1.0 - ssr / max(sst, 1e-30)
     rmse = float(np.sqrt(ssr / len(residuals))) if len(residuals) > 0 else 0.0
 
-    # Jacobian-based parameter errors (relative step, covers logK and conc params)
+    # Jacobian-based parameter errors (relative step, covers logK and conc params).
+    # Skipped when compute_hessian=False (bootstrap workers).
     n_d = len(residuals)
     param_errors = {}
-    try:
-        r0 = np.array([np.interp(t, curve["t"], curve[col]) - y
-                       for t, y, col in exp_points])
-        J  = np.zeros((n_d, n_p))
-        for k in range(n_p):
-            eps_k = max(abs(result.x[k]) * 1e-4, 1e-6)
-            dx = np.zeros(n_p); dx[k] = eps_k
-            c2 = _simulate(result.x + dx)
-            if c2 is None:
-                continue
-            r2_vec = np.array([np.interp(t, c2["t"], c2[col]) - y
-                                for t, y, col in exp_points])
-            J[:, k] = (r2_vec - r0) / eps_k
-        sigma2 = ssr / max(n_d - n_p, 1)
-        cov    = np.linalg.pinv(J.T @ J) * sigma2
-        for k in range(_n_k):
-            param_errors[fit_names[k]] = float(np.sqrt(max(cov[k, k], 0)))
-        for k in range(_n_c):
-            param_errors[fit_conc_keys[k]] = float(np.sqrt(max(cov[_n_k + k, _n_k + k], 0)))
-    except Exception:
-        pass
+    # Initialize so they're always defined even if the Hessian try block fails
+    _kin_cov = None
+    _kin_cov_names = list(fit_names) + list(fit_conc_keys)
+    if compute_hessian:
+        try:
+            r0 = np.array([np.interp(t, curve["t"], curve[col]) - y
+                           for t, y, col in exp_points])
+            J  = np.zeros((n_d, n_p))
+            for k in range(n_p):
+                eps_k = max(abs(result.x[k]) * 1e-4, 1e-6)
+                dx = np.zeros(n_p); dx[k] = eps_k
+                c2 = _simulate(result.x + dx)
+                if c2 is None:
+                    continue
+                r2_vec = np.array([np.interp(t, c2["t"], c2[col]) - y
+                                    for t, y, col in exp_points])
+                J[:, k] = (r2_vec - r0) / eps_k
+            sigma2 = ssr / max(n_d - n_p, 1)
+            cov    = np.linalg.pinv(J.T @ J) * sigma2
+            _kin_cov = np.asarray(cov, dtype=float)   # capture for diagnostics
+            for k in range(_n_k):
+                param_errors[fit_names[k]] = float(np.sqrt(max(cov[k, k], 0)))
+            for k in range(_n_c):
+                param_errors[fit_conc_keys[k]] = float(np.sqrt(max(cov[_n_k + k, _n_k + k], 0)))
+        except Exception:
+            pass
 
     _r2 = r2
     if timed_out and _r2 >= 0.99:
@@ -435,11 +463,27 @@ def fit_kinetics(parsed: dict, exp_data: dict, logk_dict: dict, fit_keys: list,
         "n_params":        n_p,
         "param_values":    fitted_logks,
         "param_errors":    param_errors,
+        "param_cov":       _kin_cov,
+        "param_cov_names": _kin_cov_names,
         "fitted_concs":    fitted_concs_k,
         "fitted_titrants": {},
         "fit_mode":        "kinetics",
+        "is_kinetics":     True,
         "timed_out":       timed_out,
         "n_iter":          getattr(result, "nit", 0),
+        # v2 diagnostics — flat residual arrays
+        "y_obs":           np.asarray(y_obs,             dtype=float),
+        "y_calc":          np.asarray(y_obs - residuals, dtype=float),
+        "residuals":       np.asarray(residuals,         dtype=float),
+        # v2 per-column arrays — same convention as NMR/CONC modules;
+        # for kinetics the per_col_x entries hold TIME values (in
+        # seconds), so the residuals plot ends up labeled "Time / s".
+        "per_col_x":       {c: np.asarray(v, dtype=float)
+                            for c, v in _per_col_t.items()},
+        "per_col_y_obs":   {c: np.asarray(v, dtype=float)
+                            for c, v in _per_col_yo.items()},
+        "per_col_y_calc":  {c: np.asarray(v, dtype=float)
+                            for c, v in _per_col_yc.items()},
     }
 
     _conv = result.success or ssr < 1e-6 or (not timed_out and _r2 >= 0.99)

@@ -36,6 +36,192 @@ from equilibrist_fit_conc import *
 from equilibrist_fit_nmr import *
 from equilibrist_fit_spectra import *
 from equilibrist_io import *
+# ── Statistical diagnostics and bootstrap CIs (added in v2) ───────────────
+# Drop-in modules.  See INTEGRATION_PATCHES.md for the rationale.
+from equilibrist_diagnostics import (augment_stats, render_diagnostics_panel,
+                                     collect_residuals_from_stats,
+                                     collect_residuals_conc,
+                                     collect_residuals_nmr_shift,
+                                     collect_residuals_spectra,
+                                     collect_residuals_kinetics,
+                                     compare_models, make_diagnostics_figure,
+                                     compute_rmse_profile,
+                                     compute_rmse_profile_2d,
+                                     make_2d_profile_figure,
+                                     render_identifiability_panel,
+                                     render_rank_analysis_panel,
+                                     compute_local_sensitivity)
+import equilibrist_bootstrap as ebs
+
+# ── v2: fragment wrapper ──────────────────────────────────────────────────
+# Use st.fragment where available so interacting with widgets inside the
+# diagnostics / bootstrap / model-comparison panels reruns ONLY that panel
+# and preserves the page scroll position.  Falls back to a no-op decorator
+# on Streamlit < 1.33 so the app still runs (just with the old behaviour).
+if hasattr(st, 'fragment'):
+    _fragment = st.fragment
+elif hasattr(st, 'experimental_fragment'):
+    _fragment = st.experimental_fragment
+else:
+    _fragment = lambda f: f
+
+
+def _indented_checkbox(label, *, indent_frac: float = 0.035, **kwargs):
+    """Render an st.checkbox visually indented under a parent expander.
+
+    Used for child toggles inside "Show residual diagnostics" (and any
+    similar parent) so the child boxes read as children, not as siblings
+    of the parent.  Eric's feedback from the tutorial 1-11 debugging
+    pass (debugging.docx item 0): "the 3 tests inside 'show residual
+    diagnostics' should have a tab, so that their boxes are underneath
+    the icon of 'show residual diagnostics'."
+
+    Implementation: split the row into a thin empty left column and a
+    wide right column holding the checkbox.  Streamlit doesn't allow
+    per-widget CSS targeting by key, so this column-pair pattern is the
+    cleanest minimum-invasive way to indent only the checkbox itself
+    without restructuring the body code that lives under
+    ``if _show_…:``.
+
+    Returns the checkbox value (matching ``st.checkbox``'s contract).
+    """
+    _spacer, _content = st.columns([indent_frac, 1.0 - indent_frac])
+    with _content:
+        return st.checkbox(label, **kwargs)
+
+
+def _write_tuple_cache(key: tuple, value) -> None:
+    """Store a value under a tuple key in session_state AND record the
+    key in a registry list so ``_serialize_tuple_caches`` can find it
+    at save time.
+
+    Background: ``st.session_state[tuple_key] = value`` works (direct
+    lookup via ``.get(tuple_key)`` returns it), but
+    ``st.session_state.keys()`` does NOT reliably yield tuple keys to
+    external iteration in Streamlit's ``SessionStateProxy``.  So the
+    Prepare-bundle code can't enumerate the caches by walking
+    ``session_state``; instead it walks this registry list (stored
+    under a plain string key, which iteration *does* expose).
+
+    Every cache write site (``_prof_cache_*``, ``_p2d_cache_*``)
+    must go through this helper — otherwise the cache is alive
+    during the session but invisible to the JSON serialiser, and
+    figures fail to re-render on reload (the user sees
+    ``profile caches: 0`` in the Prepare-bundle caption).
+    """
+    st.session_state[key] = value
+    _reg = st.session_state.setdefault("_tuple_cache_registry", [])
+    if key not in _reg:
+        _reg.append(key)
+
+
+def _reset_diagnostic_toggles():
+    """Clear all "Show X" toggle states and cached diagnostic results.
+
+    Called immediately before a new fit's ``_fit_stats`` is written into
+    session_state.  Without this, every diagnostic checkbox the user had
+    enabled for fit #N stays enabled for fit #N+1 — so the user sees a
+    stale parameter-profile, 2D-RMSE colormap, jackknife, bootstrap,
+    Monte-Carlo, or LST result generated from the *previous* fit's
+    optimum.  Resetting all toggles to False makes the user opt back in
+    to each diagnostic for the new fit, which is the correct semantics:
+    every diagnostic must reflect the *current* fit.
+
+    For the toggle (``_show_*``) keys we SET to ``False`` rather than
+    delete.  Streamlit's ``@st.fragment`` decorator caches widget state
+    independently of the public ``st.session_state`` dict; deleting a
+    fragment-hosted widget's key on its own doesn't always reach back
+    into the fragment's internal cache, so the next fragment render
+    can show the stale ``True``.  Explicitly writing ``False`` to the
+    session-state key tells the widget to render unchecked on its next
+    pass, which is what we want.
+
+    For the cache (``_bs_result_*``, ``_jk_result_*`` etc.) keys we
+    delete — those are data caches, not widget states, so removal is
+    correct.
+
+    Special case: JSON-load auto-refit.  When the user loads a session
+    JSON that contains UQ data, the load handler restores those UQ
+    dicts into the canonical ``_bs_result_*``/``_jk_result_*``/
+    ``_mc_result_*`` session_state keys, then sets ``_fit_requested``
+    so the fit re-runs on the next rerun (to reconstruct the per-fit
+    plots and diagnostic figures).  That auto-refit calls this
+    function — which would otherwise blindly wipe the just-restored
+    UQ data as "stale".  The load handler now sets a one-shot
+    ``_preserve_uq_on_next_reset`` flag in that case; when present,
+    this function skips the UQ-cache deletion (toggles are still
+    reset; only the UQ data dicts are preserved) and clears the flag.
+    """
+    _preserve_uq = bool(st.session_state.pop(
+        "_preserve_uq_on_next_reset", False))
+    _str_toggle_prefixes = (
+        "_show_",
+        "_lst_eq_chk_", "_lst_kin_chk_",
+        "_var_pick_",
+    )
+    _str_cache_prefixes = (
+        "_bs_result_", "_jk_result_", "_mc_result_", "_lst_result_",
+        "_ttest_names_", "_ttest_nulls_",
+    )
+    # Tuple cache keys: first element string starts with one of these
+    _tuple_prefixes = (
+        "_p2d_cache_", "_lst_cache_", "_jk_cache_",
+        "_mc_cache_", "_bs_cache_", "_prof_cache_",
+    )
+    # When preserving diagnostic state on a JSON-load auto-refit,
+    # exclude:
+    #   • the UQ + LST data-cache string prefixes (_bs_result_,
+    #     _jk_result_, _mc_result_, _lst_result_) so the restored
+    #     bootstrap / jackknife / Monte-Carlo / Masson-ξ panels
+    #     survive the reset;
+    #   • the 1-D / 2-D / LST profile-cache tuple prefixes
+    #     (_prof_cache_, _p2d_cache_, _lst_cache_) so the restored
+    #     RMSE-profile and colormap panels also survive; the
+    #     bootstrap / jackknife / MC tuple caches are preserved too
+    #     for symmetry;
+    #   • the LST variable-selection toggle prefixes
+    #     (_lst_eq_chk_, _lst_kin_chk_, _var_pick_) so the
+    #     variable-selection boxes redisplay the variables that were
+    #     selected when the saved Masson-ξ test was run.  ``_show_*``
+    #     panel-expand toggles still reset (so panels render
+    #     collapsed and the user clicks to reveal them — but the
+    #     data is there when they do).
+    if _preserve_uq:
+        _uq_str_prefixes  = ("_bs_result_", "_jk_result_",
+                             "_mc_result_", "_lst_result_")
+        _uq_tuple_prefixes = ("_bs_cache_", "_jk_cache_", "_mc_cache_",
+                              "_prof_cache_", "_p2d_cache_",
+                              "_lst_cache_")
+        # Toggle prefixes that gate figure rendering — the user wants
+        # the captured state to win (figures the user had open at
+        # save time should re-open after JSON load, ditto for the
+        # LST variable-selection checkboxes).  ``_show_*`` covers the
+        # outer panel-expand boxes AND the inner figure-gating boxes
+        # (``_show_jk_influence_*``, ``_show_prof_*``, ``_show_p2d_*``,
+        # ``_show_corr_*``); preserving them means after the JSON
+        # load + auto-refit, the user lands exactly where they were
+        # at save time — tables AND figures both rendered.
+        _uq_toggle_prefixes = ("_lst_eq_chk_", "_lst_kin_chk_",
+                               "_var_pick_", "_show_")
+        _str_cache_prefixes = tuple(p for p in _str_cache_prefixes
+                                     if p not in _uq_str_prefixes)
+        _tuple_prefixes = tuple(p for p in _tuple_prefixes
+                                 if p not in _uq_tuple_prefixes)
+        _str_toggle_prefixes = tuple(
+            p for p in _str_toggle_prefixes
+            if p not in _uq_toggle_prefixes)
+    for _k in list(st.session_state.keys()):
+        try:
+            if isinstance(_k, str):
+                if any(_k.startswith(_p) for _p in _str_toggle_prefixes):
+                    st.session_state[_k] = False
+                elif any(_k.startswith(_p) for _p in _str_cache_prefixes):
+                    del st.session_state[_k]
+            elif isinstance(_k, tuple) and _k and isinstance(_k[0], str) \
+                    and any(_k[0].startswith(_p) for _p in _tuple_prefixes):
+                del st.session_state[_k]
+        except Exception:
+            pass
 
 
 st.set_page_config(page_title="Equilibrist", layout="wide")
@@ -452,6 +638,12 @@ for _pk in [k for k in st.session_state if k.startswith("_persist_fit_logK_")]:
 for _pk in [k for k in st.session_state if k.startswith("_persist_fit_conc_")]:
     _fk = _pk[len("_persist_"):]   # "_persist_fit_conc_G" → "fit_conc_G"
     st.session_state[_fk] = st.session_state.pop(_pk)
+# Restore xmax across the kinetics fit's rerun.  Set by the persist
+# block at line ~1346 just before its st.rerun(); must be restored here,
+# before any widget renders, so the sidebar save block (which reads
+# ``session_state["xmax"]``) sees the correct value on Run B.
+if "_persist_xmax" in st.session_state:
+    st.session_state["xmax"] = st.session_state.pop("_persist_xmax")
 
 # ── Script upload ─────────────────────────────
 with st.sidebar:
@@ -469,25 +661,528 @@ with st.sidebar:
         st.session_state["_uploader_nonce"] = 0
 
     uploaded = st.file_uploader(
-        "Upload .txt script", type=["txt"],
+        "Upload .txt script or .json session bundle",
+        type=["txt", "json"],
         key=f"_uploader_{st.session_state['_uploader_nonce']}",
+        help="Drop a .txt Equilibrist script to start a new analysis, "
+             "or a .json session bundle (from the Save button below) "
+             "to restore a previous one — including the data file and "
+             "last fit result."
     )
     if uploaded is not None:
-        new_text = uploaded.read().decode("utf-8", errors="replace")
-        # Full reset — same as clicking "Reset / load new script"
-        # but preserve fit preferences and increment the uploader nonce
-        _fit_prefs = {k: st.session_state[k] for k in ("fit_tolerance_log", "fit_timeout")
-                      if k in st.session_state}
-        _nonce = st.session_state.get("_uploader_nonce", 0)
-        st.session_state.clear()
-        st.session_state.update(_fit_prefs)
-        st.session_state["_uploader_nonce"] = _nonce + 1
-        st.session_state["_script_text"] = new_text
-        st.session_state["_script_filename"] = uploaded.name
-        st.rerun()
+        _is_session = uploaded.name.lower().endswith(".json")
+        if _is_session:
+            # ── Session restore from JSON ─────────────────────────────
+            # Parse the bundle (SHA-256 verified inside) before
+            # touching anything; a bad file is surfaced as an error
+            # without clobbering current state.
+            try:
+                from equilibrist_session import parse_session_json
+                _raw_json = uploaded.read().decode("utf-8", errors="replace")
+                _obj = parse_session_json(_raw_json)
+            except Exception as _le:
+                st.error(
+                    f"This .json doesn't look like an Equilibrist "
+                    f"session bundle: {_le}"
+                )
+                _obj = None
+
+            if _obj is not None:
+                # Mirror the .txt branch's reset pattern: preserve fit
+                # preferences, bump BOTH uploader nonces (so the file
+                # uploader widgets get fresh keys and don't replay the
+                # JSON on the next rerun — without this, the JSON would
+                # re-trigger the restore on every rerun, an infinite
+                # loop), clear state, then re-populate from the bundle.
+                _data_in   = _obj.get("data") or {}
+                _fit_prefs = {k: st.session_state[k]
+                              for k in ("fit_tolerance_log", "fit_timeout")
+                              if k in st.session_state}
+                _nonce     = st.session_state.get("_uploader_nonce", 0)
+                _exp_nonce = st.session_state.get("_exp_uploader_nonce", 0)
+                st.session_state.clear()
+                st.session_state.update(_fit_prefs)
+                st.session_state["_uploader_nonce"]     = _nonce + 1
+                st.session_state["_exp_uploader_nonce"] = _exp_nonce + 1
+                st.session_state["_script_text"]        = _obj.get("script", "")
+                st.session_state["_script_filename"]    = (
+                    _obj.get("script_filename") or "restored.txt"
+                )
+                # Re-parse the embedded data into the mode-appropriate
+                # session dict (_nmr_data / _exp_data / _spectra_data)
+                # — the rest of the app looks at THOSE keys, not the
+                # raw bytes — by re-parsing the script to detect mode.
+                # ALSO: set ``_input_filename`` (the key that drives the
+                # "📄 file loaded" badge in the data-uploader area) and
+                # ``_pending_xmax`` (the auto-fit x-axis end), because
+                # the live uploader sets both of those alongside the
+                # data dict.  Without _input_filename the badge stays
+                # empty and the user can't tell that the data is
+                # actually loaded — they assume it isn't and re-upload.
+                if _data_in and "bytes" in _data_in:
+                    st.session_state["_exp_data_bytes"]    = _data_in["bytes"]
+                    st.session_state["_exp_data_filename"] = _data_in.get(
+                        "filename", "restored_data.xlsx")
+                    st.session_state["_input_filename"]    = _data_in.get(
+                        "filename", "restored_data.xlsx")
+                    try:
+                        _r_parsed = parse_script(_obj.get("script", ""))
+                        _raw = _data_in["bytes"]
+                        if _r_parsed.get("spectra") is not None:
+                            _loaded_r = load_spectra_data(_raw)
+                            st.session_state["_spectra_data"] = _loaded_r
+                            # Default wavelength range to the spectrum extent
+                            if _loaded_r and len(_loaded_r.get("wavelengths", [])) > 0:
+                                st.session_state["_pending_spectra_wl_min"] = \
+                                    float(_loaded_r["wavelengths"][0])
+                                st.session_state["_pending_spectra_wl_max"] = \
+                                    float(_loaded_r["wavelengths"][-1])
+                        elif _r_parsed.get("nmr") is not None:
+                            _loaded_r = load_experimental_data(_raw)
+                            st.session_state["_nmr_data"] = _loaded_r
+                        else:
+                            _loaded_r = load_experimental_data(_raw)
+                            st.session_state["_exp_data"] = _loaded_r
+                        # ── xmax restore (2026-05-22 audit) ────────────
+                        # Two-tier priority:
+                        #
+                        #   1. The widget value snapshotted into
+                        #      ``fit_state["xmax"]`` at save time (this is
+                        #      the on-screen value the user actually saw —
+                        #      may be data-derived and differ from the
+                        #      script's ``$plot xmax = …``).
+                        #
+                        #   2. Fallback to the script's ``plot_xmax``,
+                        #      which handles older JSONs saved before the
+                        #      widget-snapshot was added, and is the most
+                        #      reasonable default given the JSON has no
+                        #      other record of xmax.
+                        #
+                        # NB.  The previous behaviour wrote the raw
+                        # ``v_add_mL`` value (or x_vals[-1] for spectra)
+                        # directly into ``_pending_xmax``, producing a
+                        # mL-vs-script-units mismatch — tutorial 5: 0.15
+                        # mL appeared as xmax = 0.2 instead of H0/G0 = 3.0,
+                        # off by ~15× (caught by the unit conversion in
+                        # the live data-upload path at line ~4972-4984,
+                        # which routes through ``convert_exp_x``; that
+                        # helper isn't usable here because ``params`` /
+                        # ``network`` / ``x_expr_default`` aren't built
+                        # until later in the rerun).
+                        _xmax_saved = (_obj.get("fit_state") or {}).get("xmax")
+                        _pending_xmax_set = False
+                        if _xmax_saved is not None:
+                            try:
+                                st.session_state["_pending_xmax"] = float(_xmax_saved)
+                                _pending_xmax_set = True
+                            except (TypeError, ValueError):
+                                pass
+                        if not _pending_xmax_set:
+                            _px = _r_parsed.get("plot_xmax")
+                            if _px is not None:
+                                st.session_state["_pending_xmax"] = float(_px)
+                    except Exception as _pe:
+                        st.session_state["_restore_data_warning"] = str(_pe)
+                # Push fitted values into the _pending_* keys so the
+                # sidebar widgets show them as starting values on the
+                # next rerun — same channel the fit engine uses after
+                # a successful fit.
+                _summary = _obj.get("fit_result_summary") or {}
+                if _summary:
+                    for _name, _val in (_summary.get("param_values") or {}).items():
+                        try:
+                            st.session_state[f"_pending_logK_{_name}"] = float(_val)
+                        except Exception:
+                            pass
+                    for _root, _mM in (_summary.get("fitted_concs") or {}).items():
+                        try:
+                            st.session_state[f"_pending_conc_{_root}"] = float(_mM)
+                        except Exception:
+                            pass
+                    # fitted_titrants: parallel to fitted_concs.  Missing
+                    # pre-audit (2026-05-22) — without this, titrant
+                    # stock concentrations saved as "free parameters"
+                    # came back at their script default values, then the
+                    # auto-refit re-fit them from scratch instead of
+                    # warm-starting at the previously-converged value.
+                    for _tkey, _mM in (_summary.get("fitted_titrants") or {}).items():
+                        try:
+                            st.session_state[f"_pending_titrant_mM_{_tkey}"] = float(_mM)
+                        except Exception:
+                            pass
+                    st.session_state["_restored_fit_summary"] = _summary
+
+                # ── Restore _fit_stats so the diagnostic panels
+                # (correlation heatmap, identifiability panel,
+                # residual-diagnostic figure, AIC/BIC/F-test) render
+                # immediately, without waiting for the auto-refit
+                # below to complete (or in the case where there's
+                # nothing to refit because the JSON was saved with
+                # all parameters frozen).  Re-inflate list-shaped
+                # fields back to numpy arrays so downstream consumers
+                # don't need to know whether they came from a fresh
+                # fit or a JSON restore.
+                if _summary:
+                    _fs = dict(_summary)
+                    _pc = _fs.get("param_cov")
+                    if _pc is not None:
+                        try:
+                            _fs["param_cov"] = np.asarray(_pc, dtype=float)
+                        except Exception:
+                            _fs["param_cov"] = None
+                    for _arr_key in ("residuals", "y_calc", "y_obs"):
+                        if _fs.get(_arr_key) is not None:
+                            try:
+                                _fs[_arr_key] = np.asarray(_fs[_arr_key],
+                                                            dtype=float)
+                            except Exception:
+                                pass
+                    st.session_state["_fit_stats"] = _fs
+
+                # ── Restore the bootstrap / jackknife / Monte Carlo
+                # session-state keys so those UQ panels also render
+                # without requiring the user to click "Run bootstrap"
+                # (etc.) again after a JSON reload.  The keys are
+                # mode-suffixed (`_eq` for equilibrium fits, `_kin`
+                # for kinetics fits) — pick the right one based on
+                # the `is_kinetics` flag captured in fit_result_summary.
+                _uq_in = _obj.get("uq") or {}
+                _ws_in = _obj.get("widget_state")
+                _pc_in = _obj.get("profile_caches")
+                # Set the one-shot preserve flag iff at least one
+                # diagnostic-state field is going to be restored.
+                # Without this, the upcoming auto-refit's
+                # ``_reset_diagnostic_toggles()`` will wipe the
+                # restored UQ / LST / profile-cache / widget-toggle
+                # entries before any panel can render them.
+                if _uq_in or isinstance(_ws_in, dict) or (
+                        isinstance(_pc_in, list) and _pc_in):
+                    st.session_state["_preserve_uq_on_next_reset"] = True
+                if _uq_in:
+                    # Determine equilibrium vs kinetics so we can write
+                    # the UQ data to the session_state suffix the UI
+                    # actually reads.  Prefer the explicit `is_kinetics`
+                    # flag introduced in v2 of the session schema; for
+                    # legacy JSONs that lack it, fall back to inferring
+                    # from `fit_mode` (the two non-NMR kinetics modes
+                    # use uniquely kinetic mode strings).
+                    _fit_mode_str = str(_summary.get("fit_mode", ""))
+                    _is_kin = (
+                        bool(_summary.get("is_kinetics", False))
+                        or _fit_mode_str in ("kinetics", "kinetics_spectra")
+                    )
+                    _suf = "_kin" if _is_kin else "_eq"
+                    if isinstance(_uq_in.get("bootstrap"), dict):
+                        st.session_state[f"_bs_result{_suf}"] = _uq_in["bootstrap"]
+                    if isinstance(_uq_in.get("jackknife"), dict):
+                        st.session_state[f"_jk_result{_suf}"] = _uq_in["jackknife"]
+                    if isinstance(_uq_in.get("monte_carlo"), dict):
+                        st.session_state[f"_mc_result{_suf}"] = _uq_in["monte_carlo"]
+                    # Masson ξ (LST) result — same kin/eq suffix
+                    # convention.  Stored under ``_lst_result_*`` so
+                    # the LST UI panel re-renders the saved table
+                    # and per-paired-difference transparency view
+                    # without recomputation.
+                    if isinstance(_uq_in.get("lst"), dict):
+                        st.session_state[f"_lst_result{_suf}"] = _uq_in["lst"]
+                # Restore the diagnostic-widget input values so the
+                # boxes display what was actually used during the
+                # saved diagnostics rather than their defaults.  Done
+                # before the widgets render in the current rerun;
+                # ``st.rerun()`` below propagates these into the
+                # widget cache on the next pass.
+                if isinstance(_ws_in, dict):
+                    for _wk, _wv in _ws_in.items():
+                        if isinstance(_wk, str):
+                            st.session_state[_wk] = _wv
+                # Restore tuple-keyed profile caches (1-D & 2-D
+                # RMSE).  Encoded keys are reconstructed into tuples
+                # via ``_from_json_key``.  Older JSONs saved before
+                # the cache-key was simplified carry an extra
+                # trailing element — a sorted tuple of
+                # ``(param_name, fitted_value)`` pairs — that the
+                # current UI no longer includes when looking up.  We
+                # strip that trailing element off old-format keys so
+                # legacy JSONs still light up the panels on reload
+                # without forcing the user to re-save.
+                if isinstance(_pc_in, list) and _pc_in:
+                    try:
+                        from equilibrist_session import _from_json_key
+                        # Expected key shapes (post-strip):
+                        #   ("_prof_cache_*", span, npts)              len 3
+                        #   ("_p2d_cache_*", p1, p2, sx, sy, np)       len 6
+                        _expected_lens = {"_prof_cache_": 3,
+                                          "_p2d_cache_":  6,
+                                          "_lst_cache_":  None}
+                        _registry = st.session_state.setdefault(
+                            "_tuple_cache_registry", [])
+                        for _entry in _pc_in:
+                            if not (isinstance(_entry, list)
+                                    and len(_entry) == 2):
+                                continue
+                            _k_decoded = _from_json_key(_entry[0])
+                            if not (isinstance(_k_decoded, tuple)
+                                    and _k_decoded
+                                    and isinstance(_k_decoded[0], str)):
+                                continue
+                            _prefix_match = next(
+                                (p for p in _expected_lens
+                                 if _k_decoded[0].startswith(p)), None)
+                            if (_prefix_match
+                                    and _expected_lens[_prefix_match]
+                                    is not None
+                                    and len(_k_decoded)
+                                    > _expected_lens[_prefix_match]
+                                    and isinstance(_k_decoded[-1], tuple)):
+                                # Old-format key — trim the trailing
+                                # param_values tuple.
+                                _k_decoded = _k_decoded[:_expected_lens[
+                                    _prefix_match]]
+                            st.session_state[_k_decoded] = _entry[1]
+                            # Seed the registry so a subsequent save
+                            # (without an intervening recompute) can
+                            # still find and persist this cache entry.
+                            if _k_decoded not in _registry:
+                                _registry.append(_k_decoded)
+                    except Exception:
+                        pass
+
+                # ── Restore which parameters were being fitted ────────
+                # The "fit" checkbox next to each K / concentration /
+                # titrant input is what tells the fitter "this is a
+                # free parameter".  Their session_state keys are
+                # ``fit_logK_<kname>``, ``fit_conc_<root>``, and
+                # ``fit_titrant_mM_<tkey>``.  Without flipping these
+                # on, the restored UI shows all the fitted values but
+                # the fit engine has no parameters to fit — the auto-
+                # rerun completes instantly (with nothing to do) and
+                # the "Re-running the fit" banner appears stuck.
+                _fit_state_in = _obj.get("fit_state") or {}
+                for _kname in (_fit_state_in.get("fit_keys") or []):
+                    st.session_state[f"fit_logK_{_kname}"] = True
+                for _croot in (_fit_state_in.get("fit_conc_keys") or []):
+                    st.session_state[f"fit_conc_{_croot}"] = True
+                for _tkey in (_fit_state_in.get("fit_titrant_keys") or []):
+                    st.session_state[f"fit_titrant_mM_{_tkey}"] = True
+
+                # Auto-trigger the fit so the plot, the fitted-curve
+                # overlay, and the diagnostic panel reconstruct
+                # themselves automatically — but only if there was a
+                # fit to begin with (skip when the bundle was saved
+                # before any fit had run).
+                if _summary and (
+                    _fit_state_in.get("fit_keys") or
+                    _fit_state_in.get("fit_conc_keys") or
+                    _fit_state_in.get("fit_titrant_keys")
+                ):
+                    st.session_state["_fit_requested"] = True
+
+                # One-shot success banner shown by the block below.
+                st.session_state["_just_restored"] = {
+                    "notes":      _obj.get("notes", ""),
+                    "saved_at":   _obj.get("saved_at_utc", ""),
+                    "data_file":  _data_in.get("filename", ""),
+                    "will_refit": bool(_summary) and bool(
+                        _fit_state_in.get("fit_keys") or
+                        _fit_state_in.get("fit_conc_keys") or
+                        _fit_state_in.get("fit_titrant_keys")
+                    ),
+                }
+                st.rerun()
+        else:
+            # ── .txt script upload (original behavior) ────────────────
+            new_text = uploaded.read().decode("utf-8", errors="replace")
+            _fit_prefs = {k: st.session_state[k]
+                          for k in ("fit_tolerance_log", "fit_timeout")
+                          if k in st.session_state}
+            _nonce = st.session_state.get("_uploader_nonce", 0)
+            st.session_state.clear()
+            st.session_state.update(_fit_prefs)
+            st.session_state["_uploader_nonce"] = _nonce + 1
+            st.session_state["_script_text"] = new_text
+            st.session_state["_script_filename"] = uploaded.name
+            st.rerun()
+
+    # Brief success banner after a restore
+    _jr = st.session_state.pop("_just_restored", None)
+    if _jr:
+        if _jr.get("will_refit"):
+            st.success("Session restored — re-running the fit to "
+                       "reconstruct the plot and diagnostics…")
+        else:
+            st.success("Session restored.  Click **🔧 Fit Parameters** "
+                       "to compute the result.")
+    if st.session_state.pop("_restore_data_warning", None):
+        st.warning("Embedded data could not be re-parsed.  "
+                   "Re-upload the data file manually.")
 
     if st.session_state.get("_script_filename"):
         st.markdown(f"<span style='background:#1a6bbf;color:white;font-weight:bold;padding:3px 10px;border-radius:12px;font-size:0.82rem'>📄 {st.session_state['_script_filename']}</span>", unsafe_allow_html=True)
+
+    # ── Session save (FAIR-compliance) ───────────────────────────────────
+    # Bundle the script, the uploaded experimental data (verbatim, with
+    # a SHA-256 integrity check), the per-fit configuration, and a
+    # compact summary of the last fit result into a single JSON file.
+    # The file is human-inspectable, self-contained, and reloadable via
+    # the main script uploader above (which now accepts .json too).
+    with st.expander("💾 Save current session", expanded=False):
+        st.caption(
+            "Download a self-contained JSON bundle (script + data file "
+            "+ last fit result).  Restore later by dropping the .json "
+            "into the uploader above."
+        )
+        _script_now = st.session_state.get("_script_text", "")
+        if _script_now:
+            try:
+                from equilibrist_session import (make_session_json,
+                                                   summarize_stats)
+                _data_bytes = st.session_state.get("_exp_data_bytes")
+                _data_name  = st.session_state.get("_exp_data_filename")
+                _fit_stats  = st.session_state.get("_fit_stats") or {}
+                _fa_eq      = st.session_state.get("_fit_args_eq")
+                _fa_kin     = st.session_state.get("_fit_args_kin")
+                # Pick whichever fit_args dict is populated — kinetics
+                # branch wins if both exist (because the equilibrium
+                # block runs only after kinetics returns).
+                _fa_save = _fa_kin or _fa_eq or {}
+                _fit_state_save = {
+                    k: _fa_save.get(k) for k in (
+                        "kind", "fit_keys", "fit_conc_keys",
+                        "fit_titrant_keys", "tolerance", "maxiter",
+                        "timeout_s", "wl_min", "wl_max",
+                        "use_spectra_fit", "use_nmr_fit", "nmr_mode",
+                        "allow_neg_eps", "constraints",
+                    ) if k in _fa_save
+                }
+                _start = _fa_save.get("start_logK") or _fa_save.get("start_logk")
+                if _start:
+                    _fit_state_save["start_logK"] = dict(_start)
+                # ── xmax snapshot (2026-05-22 audit) ────────────────────
+                # The widget value of ``xmax`` can have drifted from the
+                # script's ``$plot xmax = …`` after a data upload, because
+                # the live data-load path overrides xmax with the
+                # data-derived value via ``convert_exp_x`` (tutorial 13:
+                # script says ``xmax = 3``, data covers H0/G0 only to
+                # ~0.8 → widget snaps to 0.8).  The script text is NOT
+                # rewritten when this happens, so without snapshotting
+                # the widget value here the JSON loses the user's actual
+                # on-screen xmax.  See the restore block for the read
+                # side, which prefers this value over ``plot_xmax``.
+                #
+                # Priority: ``_pending_xmax`` (queued by a recent data
+                # upload or restore but NOT yet consumed by the xmax
+                # widget's ``_num_input`` call — the save block runs
+                # BEFORE the kinetics sidebar that owns the widget, so
+                # the pending value is the most up-to-date intent) →
+                # ``session_state["xmax"]`` (the current widget value,
+                # already a post-consume snapshot).  Without consulting
+                # the pending key first, a save immediately after a
+                # data upload captures the stale pre-upload widget
+                # value (tutorial 11 pre-fit save: script xmax=3, data
+                # range 0-20 → JSON would capture 3 instead of 20).
+                _xmax_widget = st.session_state.get(
+                    "_pending_xmax", st.session_state.get("xmax"))
+                if _xmax_widget is not None:
+                    try:
+                        _fit_state_save["xmax"] = float(_xmax_widget)
+                    except (TypeError, ValueError):
+                        pass
+                _notes = st.text_input(
+                    "Notes (optional)", value="",
+                    key="_session_notes",
+                    placeholder="e.g. 1:2 binding, run 3, repeat of Fig 4a"
+                )
+                # One-click save.  Why a click-triggered button +
+                # auto-download rather than the obvious always-on
+                # ``st.download_button``: the latter bakes its bytes
+                # at *render* time, but Streamlit fragments (which
+                # host every diagnostic — bootstrap, jackknife, MC,
+                # 1-D / 2-D RMSE, Masson ξ) re-run independently of
+                # the main script, so any interaction inside a
+                # diagnostic panel (e.g. clicking "Compute profile"
+                # with new span/npts) DOES NOT re-render the save
+                # expander.  An eager download_button at the top of
+                # the page would therefore keep serving the stale
+                # JSON baked at the previous full rerun — the user's
+                # most-recent UQ work would be missing.
+                #
+                # Clicking a regular ``st.button`` outside any
+                # fragment forces a full script rerun, on which
+                # ``make_session_json`` reads the current
+                # session_state (including whatever the fragments
+                # populated on their internal reruns) and builds a
+                # fresh JSON.  The bytes are then handed to the
+                # browser via a ``<a download>`` whose click is
+                # immediately fired by an injected ``<script>``,
+                # so the file downloads without a second user
+                # action.
+                if st.button("💾 Save session JSON",
+                              key="_session_save_btn",
+                              type="primary"):
+                    from equilibrist_session import (
+                        _capture_widget_state,
+                        _serialize_tuple_caches,
+                    )
+                    _lst_for_save = (
+                        st.session_state.get("_lst_result_kin")
+                        or st.session_state.get("_lst_result_eq")
+                    )
+                    _session_json = make_session_json(
+                        script=_script_now,
+                        script_filename=st.session_state.get("_script_filename", ""),
+                        data_bytes=_data_bytes,
+                        data_filename=_data_name,
+                        fit_state=_fit_state_save,
+                        fit_result_summary=summarize_stats(_fit_stats),
+                        bootstrap_result=(st.session_state.get("_bs_result_kin")
+                                           or st.session_state.get("_bs_result_eq")),
+                        jackknife_result=(st.session_state.get("_jk_result_kin")
+                                           or st.session_state.get("_jk_result_eq")),
+                        monte_carlo_result=(st.session_state.get("_mc_result_kin")
+                                             or st.session_state.get("_mc_result_eq")),
+                        lst_result=_lst_for_save,
+                        widget_state=_capture_widget_state(st.session_state),
+                        profile_caches=_serialize_tuple_caches(st.session_state),
+                        seed=42,
+                        notes=_notes,
+                        app_version="equilibrist-v2",
+                    )
+                    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _stem = "session"
+                    if _data_name:
+                        import os as _os
+                        _stem = _os.path.splitext(_data_name)[0] or _stem
+                    _fname = f"Equilibrist_{_stem}_{_ts}.json"
+                    # Trigger the browser download by injecting a
+                    # hidden anchor + a script that clicks it.  The
+                    # data is encoded inline as a base64 data URL so
+                    # no server round-trip is needed.  Streamlit
+                    # sandboxes the injected HTML inside an iframe
+                    # but ``<a download>`` works inside the sandbox
+                    # because Streamlit's iframe sandbox includes
+                    # ``allow-downloads``.
+                    import base64 as _base64
+                    from streamlit.components.v1 import html as _components_html
+                    _b64 = _base64.b64encode(
+                        _session_json.encode("utf-8")).decode("ascii")
+                    _components_html(
+                        f"""
+                        <a id="_eq_autodl"
+                           href="data:application/json;base64,{_b64}"
+                           download="{_fname}"
+                           style="display:none">.</a>
+                        <script>
+                          document.getElementById("_eq_autodl").click();
+                        </script>
+                        """,
+                        height=0,
+                    )
+                    st.success(f"Saved as `{_fname}`")
+            except Exception as _se:
+                st.warning(f"Could not build session bundle: {_se}")
+        else:
+            st.caption("Load or write a script above to enable saving.")
+    # ── End session save ────────────────────────────────────────────────
 
 script_text = st.session_state.get("_script_text", None)
 
@@ -746,17 +1441,14 @@ if IS_KINETICS:
                     parsed_fit.get("constraints", []) if _this_fit_constrained else []
                 )
 
-                # If constraints changed state OR fitting concentrations, reset to
-                # script defaults: sidebar logK values may be far from the optimum
-                # at the script concentration, causing L-BFGS-B to push the
-                # concentration to its boundary before logK can adjust.
+                # The constraint toggle flipping does NOT reset the K's to
+                # script defaults — the sidebar K's are typically a much better
+                # starting point.  Soft constraint violations are absorbed by
+                # the penalty term in the first few iterations.
                 _script_defaults_k = {**{e["kname"]: e["logK"]   for e in parsed_fit["equilibria"]},
                                       **{r["kname"]: r["log_k"]  for r in parsed_fit.get("kinetics", [])},
                                       **{r["krname"]: r["log_kr"] for r in parsed_fit.get("kinetics", []) if "krname" in r}}
-                if _this_fit_constrained != _last_fit_constrained:
-                    _start_logk = {k: _script_defaults_k.get(k, v) for k, v in current_logk.items()}
-                else:
-                    _start_logk = current_logk
+                _start_logk = current_logk
 
                 st.session_state["_last_fit_was_constrained"] = _this_fit_constrained
 
@@ -812,7 +1504,89 @@ if IS_KINETICS:
                 # Push fitted concentration results back to sidebar
                 for _root, _mM_val in stats.get("fitted_concs", {}).items():
                     st.session_state[f"_pending_conc_{_root}"] = float(_mM_val)
+                # ── v2: canonicalise param_values across all kin fit modes ─
+                # Same logic as the equilibrium branch: ensure
+                # fit_stats["param_values"] is populated regardless of
+                # which kinetics module ran, so the Local sensitivity
+                # test (and any future diagnostic that needs the
+                # optimum) has one consistent place to read from.
+                if isinstance(stats, dict):
+                    stats.setdefault("param_values", dict(fitted))
+                # Reset diagnostic toggles + cached results so the user
+                # opts back in for the new fit (stale "show ..." plots
+                # were a real-world confusion from earlier sessions).
+                # Also bump the fit-counter — the parent diag-panel
+                # checkbox uses this as a key suffix so Streamlit's
+                # fragment-internal widget cache can't keep it stuck
+                # checked across fits (a quirk where programmatic
+                # writes to st.session_state don't always reach the
+                # fragment's cached widget state for the top-level
+                # widget in the fragment).
+                st.session_state["_fit_counter"] = int(
+                    st.session_state.get("_fit_counter", 0)) + 1
+                _reset_diagnostic_toggles()
                 st.session_state["_fit_stats"] = stats
+                # ── v2: save fit args so the bootstrap UI can find them after rerun ──
+                # Wrapped in try/except so a missing local (kinetics scope does
+                # not define `network`, `params`, or `x_expr` — those live in the
+                # equilibrium branch) cannot break the fit pipeline.  Pure
+                # kinetics bootstrap does not need any of them; only the
+                # kinetics+NMR variants do, and we build them lazily there.
+                try:
+                    _fa_kin = {
+                        "kind":              "kin",
+                        "fit_keys":          list(fit_keys_k),
+                        "fit_conc_keys":     list(fit_conc_keys_k),
+                        "use_spectra_fit":   bool(_use_spectra_fit),
+                        "use_nmr_fit":       bool(_use_nmr_fit),
+                        "nmr_mode":          (_nmr_cfg_fit["mode"] if _use_nmr_fit and _nmr_cfg_fit else None),
+                        "t_max":             float(t_max),
+                        "tolerance":         float(tol),
+                        "maxiter":           int(maxiter),
+                        "timeout_s":         float(_timeout_s),
+                        "constraints":       _active_constraints,
+                        "start_logk":        dict(_start_logk),
+                        "exp_data_fit":      exp_data_fit if not (_use_nmr_fit or _use_spectra_fit) else None,
+                        "nmr_data_fit":      _nmr_data_fit     if _use_nmr_fit     else None,
+                        "spectra_data_fit":  _spectra_data_fit if _use_spectra_fit else None,
+                        "parsed_fit":        parsed_fit,
+                    }
+                    # x_expr / network / params are only needed for the
+                    # kinetics+NMR bootstrap variants; build them lazily and
+                    # only when applicable so missing variables in pure-
+                    # kinetics scope cannot break this assignment.
+                    _fa_kin["x_expr"] = parsed_fit.get("plot_x_expr", "t")
+                    if _use_nmr_fit:
+                        try:
+                            from equilibrist_network import build_network as _bn_kin
+                            _fa_kin["network"] = _bn_kin(parsed_fit)
+                        except Exception:
+                            _fa_kin["network"] = None
+                        try:
+                            _cv_k = {k[:-1] if k.endswith('0') else k: float(v)
+                                     for k, v in parsed_fit.get("concentrations", {}).items()}
+                            _V0_k = float(list(parsed_fit.get("volumes", {1: 1}).values())[0])
+                            _fa_kin["params"] = {"conc0": _cv_k, "V0_mL": _V0_k}
+                        except Exception:
+                            _fa_kin["params"] = None
+                    # n_data for local-sensitivity test (needed by σ_cond formula)
+                    _fa_kin["n_data"] = int(stats.get("n_points", 0))
+                    st.session_state["_fit_args_kin"] = _fa_kin
+                except Exception:
+                    st.session_state["_fit_args_kin"] = None
+                # ── Augment stats with AIC/BIC + residuals (v2 diagnostics) ──
+                try:
+                    # Unified collector reads y_obs/y_calc/residuals + per-col
+                    # arrays populated by all v2-patched fit modes.  Passing
+                    # ``x_expr`` lets it label the residuals-vs-predictor
+                    # axis with the script's actual x expression (e.g.
+                    # "H0/G0") instead of generic "Data-point index".
+                    _res = collect_residuals_from_stats(
+                        stats, x_expr=parsed_fit.get("plot_x_expr", "t"))
+                    augment_stats(stats, _res)
+                    st.session_state["_fit_residuals"] = _res
+                except Exception:
+                    st.session_state["_fit_residuals"] = {}
                 _n_evals = stats.get("n_iter", 0)
                 if stats.get("timed_out"):
                     st.session_state["_fit_message"] = ("warning",
@@ -844,6 +1618,17 @@ if IS_KINETICS:
                 _cfk = f"fit_conc_{_cr}"
                 if _cfk in st.session_state:
                     st.session_state[f"_persist_{_cfk}"] = st.session_state[_cfk]
+            # Persist the xmax widget value across the rerun.  Same reason
+            # as fit_logK_* above: the kinetics sidebar (which renders
+            # ``xmax`` via ``_num_input``) runs AFTER this block, so
+            # Streamlit GC removes ``session_state['xmax']`` between runs.
+            # Without this snapshot, the sidebar save block in the next
+            # run (which runs BEFORE the kinetics sidebar) sees no widget
+            # value and silently omits ``xmax`` from the saved JSON — so a
+            # session saved immediately after a kinetics fit loses the
+            # data-derived xmax override (caught 2026-05-22, tutorial 13).
+            if "xmax" in st.session_state:
+                st.session_state["_persist_xmax"] = st.session_state["xmax"]
             st.rerun()
 
     # ── Apply pending fitted values ──────────────────────────────
@@ -1584,8 +2369,13 @@ if IS_KINETICS:
             "Upload experimental data (.xlsx)", type=["xlsx"],
             key=f"_exp_uploader_{st.session_state['_exp_uploader_nonce']}")
         if exp_uploaded is not None:
+            _raw_bytes_kin = exp_uploaded.read()
+            # Capture raw bytes + filename in session_state so the
+            # "Save session" feature can bundle the data verbatim.
+            st.session_state["_exp_data_bytes"]    = _raw_bytes_kin
+            st.session_state["_exp_data_filename"] = exp_uploaded.name
             if _kin_has_spectra:
-                _loaded_kin = load_spectra_data(exp_uploaded.read())
+                _loaded_kin = load_spectra_data(_raw_bytes_kin)
                 st.session_state["_spectra_data"] = _loaded_kin
                 st.session_state.pop("_outliers_spectra", None)
                 if _loaded_kin and len(_loaded_kin.get("wavelengths", [])) > 0:
@@ -1596,7 +2386,7 @@ if IS_KINETICS:
                     _x_last_kin = float(_loaded_kin["x_vals"][-1])
                     st.session_state["_pending_xmax"] = float(np.ceil(_x_last_kin * 10) / 10)
             else:
-                _loaded_kin = load_experimental_data(exp_uploaded.read())
+                _loaded_kin = load_experimental_data(_raw_bytes_kin)
                 if _kin_nmr_cfg_up is not None:
                     st.session_state["_nmr_data"] = _loaded_kin
                     st.session_state.pop("_outliers_nmr", None)
@@ -1640,37 +2430,1479 @@ if IS_KINETICS:
         fit_stats = st.session_state.get("_fit_stats", {})
         if fit_stats:
             _kin_fit_mode = fit_stats.get("fit_mode", "kinetics")
-            st.write("**Fit Statistics:**")
             if fit_stats.get("timed_out"):
                 _to_s = float(st.session_state.get("fit_timeout", 30))
                 _n_ev = fit_stats.get("n_iter", 0)
                 st.warning(f"⏱️ Fit timed out after {_n_ev} evaluations ({_to_s:.0f} s limit) — "
                            "showing best result found. Consider increasing Timeout.")
-            if _kin_fit_mode == "mixed":
-                r2_i = fit_stats.get("r2_integ", 0.0); rmse_i = fit_stats.get("rmse_integ", 0.0)
-                n_i  = fit_stats.get("n_integ_pts", 0)
-                r2_s = fit_stats.get("r2_shift",  0.0); rmse_s = fit_stats.get("rmse_shift",  0.0)
-                n_s  = fit_stats.get("n_shift_pts", 0)
-                st.write(f"**Integration fit** ({n_i} points)")
-                st.write(f"• R² = {r2_i:.4f}")
-                st.write(f"• RMSE = {rmse_i:.2e} mM")
-                st.write(f"**Shift fit** ({n_s} points)")
-                st.write(f"• R² = {r2_s:.4f}")
-                st.write(f"• RMSE = {rmse_s:.2e} ppm")
-                n_total_k = fit_stats.get("n_points", n_i + n_s)
-                st.write(f"• Total data points: {n_total_k}")
-                if n_total_k > fit_stats.get("n_params", 0):
-                    st.write(f"• Parameters fitted: {fit_stats.get('n_params', '?')}")
-            else:
-                st.write(f"• R² = {fit_stats['r_squared']:.4f}")
-                _rmse_unit = " ppm" if _kin_fit_mode == "shift" else " mM"
-                st.write(f"• RMSE = {fit_stats['rmse']:.2e}{_rmse_unit}")
-                st.write(f"• Data points: {fit_stats['n_points']}")
-                if fit_stats['n_points'] > fit_stats.get('n_params', 0):
-                    _rchi2 = fit_stats['ssr'] / (fit_stats['n_points'] - fit_stats['n_params'])
-                    st.write(f"• Reduced χ² = {_rchi2:.2e}")
-            if "n_iter" in fit_stats:
-                st.write(f"• Objective evaluations: {fit_stats['n_iter']}")
+
+            # ── Basic fit statistics (collapsible) ───────────────────────
+            # All the simple goodness-of-fit numbers (R², RMSE, χ²,
+            # AIC/BIC, DW/Shapiro) tucked behind a checkbox so the
+            # default post-fit view shows just the fitted-constants
+            # table.  Same hierarchy as "Show residual diagnostics".
+            @_fragment
+            def _stats_kin_frag():
+                if st.checkbox("🔢 Show fit statistics",
+                               value=False, key="_show_stats_kin",
+                               help="R², RMSE, reduced χ², information "
+                                    "criteria (AIC/BIC), and residual "
+                                    "tests (Durbin–Watson, Shapiro–Wilk)."):
+                    if _kin_fit_mode == "mixed":
+                        r2_i = fit_stats.get("r2_integ", 0.0); rmse_i = fit_stats.get("rmse_integ", 0.0)
+                        n_i  = fit_stats.get("n_integ_pts", 0)
+                        r2_s = fit_stats.get("r2_shift",  0.0); rmse_s = fit_stats.get("rmse_shift",  0.0)
+                        n_s  = fit_stats.get("n_shift_pts", 0)
+                        st.write(f"**Integration fit** ({n_i} points)")
+                        st.write(f"• R² = {r2_i:.4f}")
+                        st.write(f"• RMSE = {rmse_i:.2e} mM")
+                        st.write(f"**Shift fit** ({n_s} points)")
+                        st.write(f"• R² = {r2_s:.4f}")
+                        st.write(f"• RMSE = {rmse_s:.2e} ppm")
+                        n_total_k = fit_stats.get("n_points", n_i + n_s)
+                        st.write(f"• Total data points: {n_total_k}")
+                        if n_total_k > fit_stats.get("n_params", 0):
+                            st.write(f"• Parameters fitted: {fit_stats.get('n_params', '?')}")
+                    else:
+                        st.write(f"• R² = {fit_stats['r_squared']:.4f}")
+                        _rmse_unit = " ppm" if _kin_fit_mode == "shift" else " mM"
+                        st.write(f"• RMSE = {fit_stats['rmse']:.2e}{_rmse_unit}")
+                        st.write(f"• Data points: {fit_stats['n_points']}")
+                        if fit_stats['n_points'] > fit_stats.get('n_params', 0):
+                            _rchi2 = fit_stats['ssr'] / (fit_stats['n_points'] - fit_stats['n_params'])
+                            st.write(f"• Reduced χ² = {_rchi2:.2e}")
+                    if "n_iter" in fit_stats:
+                        st.write(f"• Objective evaluations: {fit_stats['n_iter']}")
+
+                    # ── v2 diagnostics: AIC / BIC / Durbin–Watson / Shapiro ──
+                    if "aic" in fit_stats and np.isfinite(fit_stats.get("aic", float("nan"))):
+                        st.write(f"• AIC = {fit_stats['aic']:.2f}   |   "
+                                 f"AICc = {fit_stats['aicc']:.2f}   |   "
+                                 f"BIC = {fit_stats['bic']:.2f}")
+                    if "durbin_watson" in fit_stats and np.isfinite(fit_stats.get("durbin_watson", float("nan"))):
+                        _dw = fit_stats["durbin_watson"]; _sp = fit_stats.get("shapiro_p")
+                        _dw_note = "✓" if 1.5 <= _dw <= 2.5 else "⚠ autocorrelation suspected"
+                        _sp_note = ("normal" if (_sp is not None and np.isfinite(_sp) and _sp >= 0.05)
+                                    else "non-normal" if (_sp is not None and np.isfinite(_sp)) else "")
+                        _sp_disp = f"; Shapiro p = {_sp:.3f} ({_sp_note})" if (_sp is not None and np.isfinite(_sp)) else ""
+                        st.write(f"• Durbin–Watson = {_dw:.2f} ({_dw_note}){_sp_disp}")
+                        # Spectra-mode caveat (kinetics-spectra fits — same
+                        # rationale as the equilibrium branch: residuals
+                        # are wavelength-correlated, so DW / SW lose
+                        # their diagnostic meaning).
+                        if "spectra" in str(fit_stats.get("fit_mode", "")):
+                            st.caption(
+                                "ℹ Spectra mode: residuals are wavelength-correlated by "
+                                "spectrometer bandpass, baseline drift, and spectral "
+                                "smoothness, so Durbin–Watson and Shapiro–Wilk are not "
+                                "diagnostically meaningful (DW will read low and Shapiro "
+                                "p will be tiny regardless of fit quality). The "
+                                "informative view is the residuals-vs-predictor panel."
+                            )
+            _stats_kin_frag()
+
+            # ── v2 diagnostics: residual panel (expander) ────────────────
+            _res_kin = st.session_state.get("_fit_residuals")
+            if _res_kin and len(_res_kin.get("y_obs", [])) > 0:
+                @_fragment
+                def _diag_kin_frag():
+                    # Same rationale as eq branch: fit-counter-bound
+                    # key forces a fresh widget on each fit.
+                    _n_kin = int(st.session_state.get("_fit_counter", 0))
+                    if st.checkbox("📊 Show residual diagnostics",
+                                   value=False,
+                                   key=f"_show_diag_kin_{_n_kin}"):
+                        # ── Parameter correlation heatmap (linear/Hessian) ──
+                        # Cheap (Hessian already computed at fit time), so
+                        # placed FIRST in the diagnostic toggle stack —
+                        # it's the linear/local view that should be checked
+                        # before paying for the nonlinear 1D and 2D profile
+                        # scans below.  When the heatmap shows weak
+                        # correlations but the 2D RMSE profile shows a
+                        # banana valley, the Hessian SE is misleading and
+                        # the bootstrap CIs are the trustworthy estimate.
+                        _show_corr_k = _indented_checkbox(
+                            "🔗 Show parameter correlation heatmap",
+                            value=False, key="_show_corr_kin",
+                            help="Pearson ρ derived from the Hessian "
+                                 "covariance.  Strong off-diagonal "
+                                 "entries (|ρ| > 0.9) mean the Hessian "
+                                 "standard errors understate the true "
+                                 "uncertainty.  Compare against the 2D "
+                                 "RMSE profile for the nonlinear view.")
+                        if _show_corr_k:
+                            try:
+                                from equilibrist_diagnostics import \
+                                    make_correlation_heatmap
+                                _figh = make_correlation_heatmap(
+                                    fit_stats,
+                                    title="Parameter correlation matrix")
+                                st.pyplot(_figh, clear_figure=False)
+                                import io as _io
+                                _bufh = _io.BytesIO()
+                                _figh.savefig(_bufh, format="png", dpi=200,
+                                              bbox_inches="tight")
+                                _bufh.seek(0)
+                                _tsh = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                st.download_button(
+                                    "Download correlation heatmap PNG",
+                                    data=_bufh.getvalue(),
+                                    file_name=f"Equilibrist_corr_"
+                                              f"{_tsh}.png",
+                                    mime="image/png",
+                                    key="_corr_dl_kin")
+                            except Exception as _ce:
+                                st.error(f"Correlation heatmap failed: {_ce}")
+
+                        # ── Parameter identifiability — sloppy spectrum ──
+                        # Eigenanalysis of the same Hessian covariance,
+                        # giving the GLOBAL view: which combinations of
+                        # parameters are well/poorly determined.  The
+                        # correlation heatmap above is the pairwise
+                        # picture, and the 2D RMSE profile below is the
+                        # nonlinear pairwise picture; this panel is the
+                        # multi-parameter generalization — eigenvalues
+                        # sorted ascending, with each eigendirection
+                        # labelled by its dominant linear combination
+                        # and tagged stiff / intermediate / sloppy.
+                        # Condition number κ summarises the degeneracy
+                        # of the fit.  Especially useful for models
+                        # with many coupled parameters (≥ 4 K's or
+                        # rate constants).
+                        _show_ident_k = _indented_checkbox(
+                            "🔬 Show parameter identifiability "
+                            "(sloppy spectrum)",
+                            value=False, key="_show_ident_kin",
+                            help="Eigendecomposition of the Hessian "
+                                 "covariance.  Spread of σᵢ across many "
+                                 "decades = sloppy model — some parameter "
+                                 "combinations are unconstrained by the "
+                                 "data.  Brown & Sethna 2003; Gutenkunst "
+                                 "et al. 2007; Hibbert & Thordarson 2016.")
+                        if _show_ident_k:
+                            try:
+                                render_identifiability_panel(
+                                    fit_stats, key="ident_kin")
+                            except Exception as _ie:
+                                st.error(f"Identifiability analysis failed: {_ie}")
+
+                        # ── Parameter significance — t-test ──────────────
+                        # Per-parameter (θ̂ − θ₀) / SE, p-value from
+                        # Student's t with df = n − p.  The user can
+                        # override θ₀ per row via the editable column
+                        # (default 0, which for log K means K = 1, and
+                        # for log conc means c = 1 mM — handy sanity
+                        # check).  Cheap to compute (just reads
+                        # param_errors that were already populated for
+                        # the diagnostics panel) and complements the
+                        # heatmap by reporting the *significance* of
+                        # each estimate rather than its correlation
+                        # with others.
+                        _show_ttest_k = _indented_checkbox(
+                            "📐 Show parameter significance (t-test)",
+                            value=False, key="_show_ttest_kin",
+                            help="t = (θ̂ − θ₀) / SE, two-tailed p-value "
+                                 "from Student's t with df = n − p.  "
+                                 "Estimates and SE are in log10 units; "
+                                 "edit the Null column to test against "
+                                 "literature values (e.g. log K = 4.5).")
+                        if _show_ttest_k:
+                            try:
+                                from equilibrist_diagnostics import \
+                                    compute_param_t_tests
+                                _nul_key_k = "_ttest_nulls_kin"
+                                _nul_overrides_k = st.session_state.get(
+                                    _nul_key_k, {})
+                                _rows_k = compute_param_t_tests(
+                                    fit_stats, _nul_overrides_k)
+                                if not _rows_k:
+                                    st.info("No fitted parameters with "
+                                            "standard errors available.")
+                                else:
+                                    import pandas as _pd
+                                    # Stash name order so the on_change
+                                    # callback can map row indices →
+                                    # parameter names without us having
+                                    # to retrieve the editor's internal
+                                    # state in the wrong order.
+                                    _names_k = [r["name"] for r in _rows_k]
+                                    st.session_state["_ttest_names_kin"] = _names_k
+
+                                    def _on_ttest_kin_change():
+                                        # Runs BEFORE the next rerun's
+                                        # script body, so by the time
+                                        # the fragment re-executes the
+                                        # nulls are already updated and
+                                        # t/p recompute correctly — no
+                                        # explicit st.rerun() needed
+                                        # (which would scroll the page
+                                        # back to the top).
+                                        _state = st.session_state.get(
+                                            "_ttest_editor_kin", {}) or {}
+                                        _ed_rows = _state.get(
+                                            "edited_rows", {}) or {}
+                                        if not _ed_rows:
+                                            return
+                                        _names = st.session_state.get(
+                                            "_ttest_names_kin", [])
+                                        _nulls = dict(st.session_state.get(
+                                            "_ttest_nulls_kin", {}))
+                                        for _ri, _ch in _ed_rows.items():
+                                            try:
+                                                _i = int(_ri)
+                                                if (_i < len(_names)
+                                                        and "Null θ₀" in _ch):
+                                                    _nulls[_names[_i]] = float(_ch["Null θ₀"])
+                                            except (ValueError, TypeError, KeyError):
+                                                pass
+                                        st.session_state["_ttest_nulls_kin"] = _nulls
+
+                                    _df_k = _pd.DataFrame(_rows_k)
+                                    _df_disp_k = _pd.DataFrame({
+                                        "Parameter":      _df_k["name"],
+                                        "Kind":           _df_k["kind"],
+                                        "Estimate (log)": _df_k["value"].round(4),
+                                        "SE (log)":       _df_k["se"].round(4),
+                                        "Null θ₀":        _df_k["null"].round(4),
+                                        "t":              _df_k["t"].round(2),
+                                        "p":              _df_k["p"].map(
+                                            lambda v: f"{v:.2e}" if _pd.notna(v) else "n/a"),
+                                        "Sig":            _df_k["stars"],
+                                    })
+                                    st.data_editor(
+                                        _df_disp_k,
+                                        column_config={
+                                            "Parameter":      st.column_config.TextColumn(disabled=True),
+                                            "Kind":           st.column_config.TextColumn(disabled=True),
+                                            "Estimate (log)": st.column_config.NumberColumn(disabled=True, format="%.4f"),
+                                            "SE (log)":       st.column_config.NumberColumn(disabled=True, format="%.4f"),
+                                            "Null θ₀":        st.column_config.NumberColumn(
+                                                                  required=True,
+                                                                  format="%.4f",
+                                                                  help="θ₀ used for the t-test.  "
+                                                                       "Edit to compare against a "
+                                                                       "literature value (in log "
+                                                                       "units).  Default 0."),
+                                            "t":              st.column_config.NumberColumn(disabled=True, format="%.2f"),
+                                            "p":              st.column_config.TextColumn(disabled=True),
+                                            "Sig":            st.column_config.TextColumn(disabled=True,
+                                                                  help="*** p<0.001, ** p<0.01, "
+                                                                       "* p<0.05, n.s. otherwise"),
+                                        },
+                                        hide_index=True,
+                                        use_container_width=True,
+                                        on_change=_on_ttest_kin_change,
+                                        key="_ttest_editor_kin")
+                                    if _rows_k and _rows_k[0]["df"] > 0:
+                                        st.caption(
+                                            f"Degrees of freedom: "
+                                            f"df = {_rows_k[0]['df']} "
+                                            f"(n − p). Estimates and SE "
+                                            f"shown in log10 units.")
+                            except Exception as _te:
+                                st.error(f"t-test failed: {_te}")
+
+                        # ── Rank analysis (EFA / scree / TFA) ────────
+                        # Data-space diagnostic — see equilibrium-side
+                        # comment for rationale.  Only visible when the
+                        # fit produced a multi-channel data matrix
+                        # (kinetics-with-spectra; multi-signal kinetics
+                        # NMR shift/integ).
+                        if fit_stats.get("data_matrix") is not None:
+                            _show_rank_k = _indented_checkbox(
+                                "📊 Show data-rank analysis "
+                                "(EFA / scree / TFA)",
+                                value=False, key="_show_rank_kin",
+                                help="Evolving Factor Analysis + "
+                                     "Malinowski IND + Target Factor "
+                                     "Analysis on the data matrix "
+                                     "D = C·E^T.  EFA reveals when "
+                                     "each species' contribution rises "
+                                     "above the noise floor; IND "
+                                     "recommends a rank; TFA projects "
+                                     "each fitted pure spectrum onto "
+                                     "the data's factor space to check "
+                                     "that the fitted ε is actually "
+                                     "supported by the data.  Maeder "
+                                     "& Zuberbühler 1986; "
+                                     "Malinowski 1991.")
+                            if _show_rank_k:
+                                try:
+                                    render_rank_analysis_panel(
+                                        fit_stats, key="rank_kin")
+                                except Exception as _re:
+                                    st.error(f"Rank analysis failed: {_re}")
+
+                        # Optional RMSE parameter profile (Musketeer §4.4
+                        # style).  Expensive — refits at every grid point
+                        # for every fitted parameter — so it's behind a
+                        # checkbox and cached in session_state.
+                        _show_prof = _indented_checkbox(
+                            "🔍 Show parameter profile (RMSE vs each "
+                            "parameter)",
+                            value=False, key="_show_prof_kin",
+                            help="For each fitted parameter, pins it at a "
+                                 "grid of values around the optimum and "
+                                 "refits the others.  Sharp valleys = "
+                                 "well-determined parameter; flat regions "
+                                 "= unidentifiable.")
+                        _prof = None
+                        if _show_prof:
+                            _fa = st.session_state.get("_fit_args_kin")
+                            if not _fa:
+                                st.info("Click **Fit** first to enable "
+                                        "the parameter profile.")
+                            else:
+                                col_a, col_b = st.columns(2)
+                                _p_span = col_a.number_input(
+                                    "Span (log units, ±)", min_value=0.1,
+                                    max_value=3.0, value=0.5, step=0.1,
+                                    key="_prof_span_kin")
+                                _p_npts = col_b.number_input(
+                                    "Grid points (odd)", min_value=5,
+                                    max_value=51, value=11, step=2,
+                                    key="_prof_npts_kin")
+                                _prof_par_kin = st.checkbox(
+                                    "Parallel (use all cores)",
+                                    value=False, key="_prof_par_kin",
+                                    help="Run independent grid-point "
+                                         "refits in parallel via joblib. "
+                                         "Speeds up large profiles "
+                                         "roughly linearly with core count.")
+                                _prof_jobs_kin = -1 if _prof_par_kin else 1
+                                # Cache key intentionally OMITS the
+                                # fitted ``param_values`` tuple: every
+                                # new fit clears all ``_prof_cache_*``
+                                # entries via ``_reset_diagnostic_toggles``,
+                                # so staleness is impossible while the
+                                # cache is alive.  Including the
+                                # parameter-value tuple in the key
+                                # made the cache fragile across a JSON
+                                # save / reload because any bit-level
+                                # difference between save-time and
+                                # post-reload-refit parameter values
+                                # caused a cache miss and the saved
+                                # profile failed to re-render.
+                                _cache_key = ("_prof_cache_kin",
+                                              float(_p_span), int(_p_npts))
+                                _cached = st.session_state.get(_cache_key)
+                                if _cached is not None:
+                                    _prof = _cached
+                                else:
+                                    if st.button("Compute profile",
+                                                 key="_prof_btn_kin"):
+                                        _bar = st.progress(0.0,
+                                            text="Computing profile…")
+                                        def _cb(f, m):
+                                            try:
+                                                _bar.progress(min(1.0, f),
+                                                              text=m)
+                                            except Exception:
+                                                pass
+                                        try:
+                                            _fa_kin_prof = dict(_fa)
+                                            _fa_kin_prof["kind"] = "kin"
+                                            _prof = compute_rmse_profile(
+                                                _fa_kin_prof,
+                                                fit_stats.get("param_values", {}),
+                                                span=float(_p_span),
+                                                n_pts=int(_p_npts),
+                                                fitted_concs_mM=fit_stats.get("fitted_concs"),
+                                                n_jobs=_prof_jobs_kin,
+                                                progress_callback=_cb)
+                                            _write_tuple_cache(_cache_key, _prof)
+                                            _bar.empty()
+                                        except Exception as _pe:
+                                            _bar.empty()
+                                            st.error(f"Profile failed: {_pe}")
+                        render_diagnostics_panel(fit_stats, _res_kin,
+                                                 key="diag_kin",
+                                                 rmse_profile=_prof)
+
+                        # ── 2D RMSE profile (pairwise correlation diagnostic) ──
+                        # Lives as a peer to the 1D profile.  Different
+                        # output channel (its own colormap panel below the
+                        # 2×2 figure) and a much higher compute cost
+                        # (n_pts² refits per pair, vs n_params×n_pts for
+                        # 1D) — so it gets its own toggle and its own
+                        # cache.  Enabled when at least 2 parameters
+                        # were fitted; auto-selects the pair when
+                        # exactly 2, otherwise asks via dropdowns.
+                        _show_p2d_k = _indented_checkbox(
+                            "🌐 Show 2D parameter profile "
+                            "(RMSE colormap for a pair)",
+                            value=False, key="_show_p2d_kin",
+                            help="At each (X, Y) grid point both "
+                                 "parameters are pinned and every "
+                                 "OTHER free parameter is refit. "
+                                 "Long diagonal valleys = strong "
+                                 "pairwise correlation; round wells "
+                                 "= independently identified.")
+                        if _show_p2d_k:
+                            _fa_k_for2d = st.session_state.get("_fit_args_kin")
+                            if not _fa_k_for2d:
+                                st.info("Click **Fit** first to enable "
+                                        "the 2D profile.")
+                            else:
+                                # Build the candidate parameter list
+                                # in log10 units (K's natively; concs
+                                # and titrants converted from mM)
+                                _cands = {}
+                                for _n, _v in (fit_stats.get(
+                                        "param_values", {}) or {}).items():
+                                    try:
+                                        _cands[_n] = float(_v)
+                                    except Exception: pass
+                                for _n, _mM in (fit_stats.get(
+                                        "fitted_concs", {}) or {}).items():
+                                    try:
+                                        _v = float(_mM)
+                                        if _v > 0:
+                                            _cands[_n] = float(np.log10(_v))
+                                    except Exception: pass
+                                _names = list(_cands.keys())
+                                if len(_names) < 2:
+                                    st.info("Need at least 2 fitted "
+                                            "parameters to build a 2D "
+                                            "profile.")
+                                else:
+                                    if len(_names) == 2:
+                                        _p1_k, _p2_k = _names[0], _names[1]
+                                        st.caption(f"Auto-selected: "
+                                                   f"**{_p1_k}** vs **{_p2_k}** "
+                                                   "(only two fitted).")
+                                    else:
+                                        c1, c2 = st.columns(2)
+                                        _p1_k = c1.selectbox(
+                                            "X-axis parameter", _names,
+                                            index=0, key="_p2d_p1_kin")
+                                        _p2_k = c2.selectbox(
+                                            "Y-axis parameter", _names,
+                                            index=1, key="_p2d_p2_kin")
+                                    c_sx, c_sy, c_np = st.columns(3)
+                                    _sx_k = c_sx.number_input(
+                                        "Span X (log ±)", min_value=0.1,
+                                        max_value=3.0, value=0.5, step=0.1,
+                                        key="_p2d_sx_kin")
+                                    _sy_k = c_sy.number_input(
+                                        "Span Y (log ±)", min_value=0.1,
+                                        max_value=3.0, value=0.5, step=0.1,
+                                        key="_p2d_sy_kin")
+                                    _np_k = c_np.number_input(
+                                        "Grid (per axis, odd)",
+                                        min_value=5, max_value=31,
+                                        value=11, step=2,
+                                        key="_p2d_np_kin")
+                                    _par2_k = st.checkbox(
+                                        "Parallel (use all cores)",
+                                        value=True, key="_p2d_par_kin",
+                                        help="Strongly recommended — "
+                                             "2D scans run n_pts² refits.")
+                                    _p2d_jobs = -1 if _par2_k else 1
+                                    if _p1_k == _p2_k:
+                                        st.warning("Pick two **different** "
+                                                   "parameters.")
+                                    else:
+                                        # Cache key omits the per-fit
+                                        # parameter-value tuple — see
+                                        # the 1-D profile cache for the
+                                        # rationale (invariant across
+                                        # JSON save/reload now that the
+                                        # reset function handles
+                                        # invalidation on new fits).
+                                        _ck = ("_p2d_cache_kin", _p1_k, _p2_k,
+                                               float(_sx_k), float(_sy_k),
+                                               int(_np_k))
+                                        _cached2 = st.session_state.get(_ck)
+                                        if _cached2 is not None:
+                                            _scan2 = _cached2
+                                        else:
+                                            _scan2 = None
+                                            if st.button(
+                                                    "Compute 2D profile",
+                                                    key="_p2d_btn_kin"):
+                                                _bar2 = st.progress(0.0,
+                                                    text="Computing 2D profile…")
+                                                def _cb2(f, m):
+                                                    try: _bar2.progress(min(1.0, f), text=m)
+                                                    except Exception: pass
+                                                try:
+                                                    _fa_k_prof2 = dict(_fa_k_for2d)
+                                                    _fa_k_prof2["kind"] = "kin"
+                                                    _scan2 = compute_rmse_profile_2d(
+                                                        _fa_k_prof2,
+                                                        _p1_k, _cands[_p1_k],
+                                                        _p2_k, _cands[_p2_k],
+                                                        span_x=float(_sx_k),
+                                                        span_y=float(_sy_k),
+                                                        n_pts_x=int(_np_k),
+                                                        n_pts_y=int(_np_k),
+                                                        n_jobs=_p2d_jobs,
+                                                        progress_callback=_cb2)
+                                                    _write_tuple_cache(_ck, _scan2)
+                                                    _bar2.empty()
+                                                except Exception as _e2:
+                                                    _bar2.empty()
+                                                    st.error(f"2D profile failed: {_e2}")
+                                        if _scan2 is not None:
+                                            try:
+                                                _fig2 = make_2d_profile_figure(
+                                                    _scan2,
+                                                    title=f"2D RMSE profile: "
+                                                          f"{_p1_k} vs {_p2_k}",
+                                                    param_cov=fit_stats.get("param_cov"),
+                                                    cov_names=fit_stats.get("param_cov_names"),
+                                                    constraints=_fa_k_for2d.get("constraints"))
+                                                st.pyplot(_fig2, clear_figure=False)
+                                                import io as _io
+                                                _buf2 = _io.BytesIO()
+                                                _fig2.savefig(_buf2, format="png",
+                                                              dpi=200,
+                                                              bbox_inches="tight")
+                                                _buf2.seek(0)
+                                                _ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                                st.download_button(
+                                                    "Download 2D profile PNG",
+                                                    data=_buf2.getvalue(),
+                                                    file_name=f"Equilibrist_2Dprofile_"
+                                                              f"{_p1_k}_{_p2_k}_{_ts2}.png",
+                                                    mime="image/png",
+                                                    key="_p2d_dl_kin")
+                                            except Exception as _re:
+                                                st.error(f"Could not render 2D "
+                                                         f"figure: {_re}")
+                _diag_kin_frag()
+
+            # ── v2 bootstrap CIs (toggle, in fragment) ───────────────────
+            @_fragment
+            def _bs_kin_frag():
+                if st.checkbox("🔁 Show bootstrap confidence intervals",
+                               value=False, key="_show_bs_kin"):
+                    st.caption("Resamples fit residuals to estimate CIs without "
+                               "assuming Gaussian errors. Recommended when "
+                               "Shapiro p < 0.05 above. Each iteration is a full refit.")
+                    _fa = st.session_state.get("_fit_args_kin")
+                    if not _fa:
+                        st.info("Click **Fit** once with the current script and data "
+                                "to enable bootstrap.  (The bootstrap reuses the exact "
+                                "configuration of the most recent fit.)")
+                    else:
+                        _bs_n   = st.number_input("Iterations", min_value=20, max_value=10000,
+                                                  value=200, step=50, key="_bs_n_kin")
+                        _bs_mth = st.selectbox("Resampling method",
+                                               ["residual", "parametric", "wild"],
+                                               index=0, key="_bs_mth_kin")
+                        _bs_par = st.checkbox("Parallel (use all cores)",
+                                              value=False, key="_bs_par_kin")
+                        if st.button("Run bootstrap", key="_bs_run_kin"):
+                            _pb = st.progress(0.0, text="Bootstrap running…")
+                            _cb = lambda i, N: _pb.progress(min(i / max(N,1), 1.0),
+                                                            text=f"Bootstrap {i}/{N}")
+                            _jobs = -1 if _bs_par else 1
+                            try:
+                                if _fa["use_spectra_fit"]:
+                                    _r = ebs.bootstrap_kinetics_spectra(
+                                        _fa["parsed_fit"], _fa["start_logk"],
+                                        _fa["spectra_data_fit"], _fa["fit_keys"],
+                                        t_max=_fa["t_max"], n_pts=200,
+                                        wl_min=_fa.get("wl_min", 200.0),
+                                        wl_max=_fa.get("wl_max", 800.0),
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        timeout_s=_fa["timeout_s"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        progress_callback=_cb)
+                                elif _fa["use_nmr_fit"] and _fa["nmr_mode"] == "shift":
+                                    _r = ebs.bootstrap_kinetics_nmr_shifts(
+                                        _fa["parsed_fit"], _fa["network"], _fa["nmr_data_fit"],
+                                        _fa["params"], _fa["start_logk"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        t_max=_fa["t_max"], n_pts=200,
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        timeout_s=_fa["timeout_s"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        progress_callback=_cb)
+                                elif _fa["use_nmr_fit"] and _fa["nmr_mode"] == "integration":
+                                    _r = ebs.bootstrap_kinetics_nmr_integration(
+                                        _fa["parsed_fit"], _fa["network"], _fa["nmr_data_fit"],
+                                        _fa["params"], _fa["start_logk"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        t_max=_fa["t_max"], n_pts=200,
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        timeout_s=_fa["timeout_s"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        progress_callback=_cb)
+                                elif _fa["use_nmr_fit"] and _fa["nmr_mode"] == "mixed":
+                                    _r = ebs.bootstrap_kinetics_nmr_mixed(
+                                        _fa["parsed_fit"], _fa["network"], _fa["nmr_data_fit"],
+                                        _fa["params"], _fa["start_logk"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        t_max=_fa["t_max"], n_pts=200,
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        timeout_s=_fa["timeout_s"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        progress_callback=_cb)
+                                else:
+                                    _r = ebs.bootstrap_kinetics(
+                                        _fa["parsed_fit"], _fa["exp_data_fit"] or {},
+                                        _fa["start_logk"], _fa["fit_keys"],
+                                        t_max=_fa["t_max"], n_pts=200,
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        timeout_s=_fa["timeout_s"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        progress_callback=_cb)
+                                _pb.empty()
+                                st.session_state["_bs_result_kin"] = _r
+                            except Exception as _bse:
+                                _pb.empty()
+                                import traceback as _tb_bs
+                                st.error(f"Bootstrap failed: {_bse}")
+                                st.caption(_tb_bs.format_exc())
+                        _br = st.session_state.get("_bs_result_kin")
+                        if _br and _br.get("ci"):
+                            st.caption(f"{_br['n_success']}/{_br['n_bootstrap']} bootstrap "
+                                       f"fits converged ({_br['wall_seconds']:.1f}s; "
+                                       f"method = {_br['method']})")
+                            # ── Multi-level CIs always shown ──
+                            # The bootstrap stored the raw samples
+                            # ({param: ndarray}) so all four standard
+                            # percentile intervals (50/80/95/99 %, the
+                            # SupraFit / SIVVU convention) are computed
+                            # on the fly without re-resampling.  Columns
+                            # are ordered widest → narrowest so the eye
+                            # moves from the conservative interval to
+                            # the tight one.
+                            _levels_kin = [99, 95, 80, 50]
+                            _samples_kin = _br.get("samples") or {}
+                            _rows = []
+                            for _n in _br["ci"].keys():
+                                _pt = _br["best_fit"].get(_n, float("nan"))
+                                _s = np.asarray(_samples_kin.get(_n, []),
+                                                dtype=float)
+                                _s = _s[np.isfinite(_s)]
+                                _row = {"parameter": _n,
+                                        "point":  f"{_pt:+.4f}",
+                                        "median": (f"{np.median(_s):+.4f}"
+                                                    if _s.size else "—"),
+                                        "σ":      (f"{np.std(_s, ddof=1):.4f}"
+                                                    if _s.size > 1 else "—")}
+                                for _lvl in _levels_kin:
+                                    if _s.size:
+                                        _alpha = 1.0 - _lvl / 100.0
+                                        _lo, _hi = np.quantile(
+                                            _s, [_alpha/2, 1 - _alpha/2])
+                                        _row[f"{_lvl} % CI"] = \
+                                            f"[{_lo:+.4f}, {_hi:+.4f}]"
+                                    else:
+                                        _row[f"{_lvl} % CI"] = "—"
+                                _rows.append(_row)
+                            st.dataframe(_rows, hide_index=True,
+                                          use_container_width=True)
+            _bs_kin_frag()
+
+            # ── v2 jackknife (leave-one-out) — kinetics branch ────────
+            if fit_stats:
+                @_fragment
+                def _jk_kin_frag():
+                    if st.checkbox("🪛 Show jackknife (leave-one-out) analysis",
+                                   value=False, key="_show_jk_kin",
+                                   help="For each refit the jackknife "
+                                        "removes one full titration "
+                                        "step — that is, all signal "
+                                        "columns (or all wavelengths "
+                                        "for UV\u2013Vis spectra; all "
+                                        "observed species at one time "
+                                        "for kinetics) at one x-value, "
+                                        "simultaneously."):
+                        _fa_jk_k = st.session_state.get("_fit_args_kin")
+                        if not _fa_jk_k:
+                            st.info("Click **Fit** once with the current "
+                                    "script and data to enable jackknife.")
+                        else:
+                            _jk_par_k = st.checkbox(
+                                "Parallel (use all cores)",
+                                value=False, key="_jk_par_kin")
+                            if st.button("Run jackknife",
+                                          key="_jk_run_kin"):
+                                _pb_jk_k = st.progress(
+                                    0.0, text="Jackknife running…")
+                                _cb_jk_k = lambda i, N: _pb_jk_k.progress(
+                                    min(i / max(N, 1), 1.0),
+                                    text=f"Jackknife {i}/{N}")
+                                _jobs_jk_k = -1 if _jk_par_k else 1
+                                _to_s_k = float(st.session_state.get(
+                                    "fit_timeout", 30))
+                                try:
+                                    _jr_k = None
+                                    if _fa_jk_k.get("use_spectra_fit"):
+                                        # kinetics + spectra
+                                        _jr_k = ebs.jackknife_kinetics_spectra(
+                                            _fa_jk_k["parsed_fit"],
+                                            _fa_jk_k["start_logk"],
+                                            _fa_jk_k["spectra_data_fit"],
+                                            _fa_jk_k["fit_keys"],
+                                            _fa_jk_k["t_max"], 100,
+                                            _fa_jk_k.get("wl_min", 200),
+                                            _fa_jk_k.get("wl_max", 800),
+                                            n_jobs=_jobs_jk_k,
+                                            tolerance=_fa_jk_k["tolerance"],
+                                            maxiter=_fa_jk_k["maxiter"],
+                                            timeout_s=_to_s_k,
+                                            constraints=_fa_jk_k["constraints"],
+                                            fit_conc_keys=_fa_jk_k["fit_conc_keys"],
+                                            allow_negative_eps=_fa_jk_k.get("allow_neg_eps", False),
+                                            progress_callback=_cb_jk_k)
+                                    elif _fa_jk_k.get("use_nmr_fit") and _fa_jk_k.get("nmr_mode") == "shift":
+                                        _jr_k = ebs.jackknife_kinetics_nmr_shift(
+                                            _fa_jk_k["parsed_fit"],
+                                            _fa_jk_k["start_logk"],
+                                            _fa_jk_k["nmr_data_fit"],
+                                            _fa_jk_k["fit_keys"],
+                                            _fa_jk_k["t_max"], 100,
+                                            n_jobs=_jobs_jk_k,
+                                            tolerance=_fa_jk_k["tolerance"],
+                                            maxiter=_fa_jk_k["maxiter"],
+                                            timeout_s=_to_s_k,
+                                            constraints=_fa_jk_k["constraints"],
+                                            fit_conc_keys=_fa_jk_k["fit_conc_keys"],
+                                            progress_callback=_cb_jk_k)
+                                    elif _fa_jk_k.get("use_nmr_fit") and _fa_jk_k.get("nmr_mode") == "integration":
+                                        _jr_k = ebs.jackknife_kinetics_nmr_integration(
+                                            _fa_jk_k["parsed_fit"],
+                                            _fa_jk_k["start_logk"],
+                                            _fa_jk_k["nmr_data_fit"],
+                                            _fa_jk_k["fit_keys"],
+                                            _fa_jk_k["t_max"], 100,
+                                            n_jobs=_jobs_jk_k,
+                                            tolerance=_fa_jk_k["tolerance"],
+                                            maxiter=_fa_jk_k["maxiter"],
+                                            timeout_s=_to_s_k,
+                                            constraints=_fa_jk_k["constraints"],
+                                            fit_conc_keys=_fa_jk_k["fit_conc_keys"],
+                                            progress_callback=_cb_jk_k)
+                                    elif _fa_jk_k.get("use_nmr_fit") and _fa_jk_k.get("nmr_mode") == "mixed":
+                                        _jr_k = ebs.jackknife_kinetics_nmr_mixed(
+                                            _fa_jk_k["parsed_fit"],
+                                            _fa_jk_k["start_logk"],
+                                            _fa_jk_k["nmr_data_fit"],
+                                            _fa_jk_k["fit_keys"],
+                                            _fa_jk_k["t_max"], 100,
+                                            n_jobs=_jobs_jk_k,
+                                            tolerance=_fa_jk_k["tolerance"],
+                                            maxiter=_fa_jk_k["maxiter"],
+                                            timeout_s=_to_s_k,
+                                            constraints=_fa_jk_k["constraints"],
+                                            fit_conc_keys=_fa_jk_k["fit_conc_keys"],
+                                            progress_callback=_cb_jk_k)
+                                    else:
+                                        # pure kinetics
+                                        _jr_k = ebs.jackknife_kinetics(
+                                            _fa_jk_k["parsed_fit"],
+                                            _fa_jk_k["exp_data_fit"],
+                                            _fa_jk_k["start_logk"],
+                                            _fa_jk_k["fit_keys"],
+                                            _fa_jk_k["t_max"], 100,
+                                            n_jobs=_jobs_jk_k,
+                                            tolerance=_fa_jk_k["tolerance"],
+                                            maxiter=_fa_jk_k["maxiter"],
+                                            timeout_s=_to_s_k,
+                                            constraints=_fa_jk_k["constraints"],
+                                            fit_conc_keys=_fa_jk_k["fit_conc_keys"],
+                                            progress_callback=_cb_jk_k)
+                                    if _jr_k is not None:
+                                        st.session_state["_jk_result_kin"] = _jr_k
+                                except Exception as _jke_k:
+                                    _pb_jk_k.empty()
+                                    import traceback as _tb_jk_k
+                                    st.error(f"Jackknife failed: {_jke_k}")
+                                    st.caption(_tb_jk_k.format_exc())
+                                else:
+                                    _pb_jk_k.empty()
+
+                            _jr_k = st.session_state.get("_jk_result_kin")
+                            if _jr_k is not None and not _jr_k.get("jack_se"):
+                                _msg = (_jr_k.get("best_message")
+                                         or "Jackknife produced no "
+                                            "estimates (0 successful refits).")
+                                st.warning(f"Jackknife: {_msg}")
+                            if _jr_k and _jr_k.get("jack_se"):
+                                st.caption(
+                                    f"{_jr_k['n_success']}/{_jr_k['n_jack']} "
+                                    f"refits successful "
+                                    f"({_jr_k['wall_seconds']:.1f}s)")
+                                _rows_jk_k = []
+                                _kinds_kin = _jr_k.get("param_kinds", {}) or {}
+                                for _n, _se in _jr_k["jack_se"].items():
+                                    _fv = _jr_k["best_fit"].get(
+                                        _n, float("nan"))
+                                    _kind = _kinds_kin.get(_n, "log")
+                                    if   _kind == "log":       _unit_str = "log10"
+                                    elif _kind == "linear_k":  _unit_str = "linear"
+                                    else:                       _unit_str = "mM"
+                                    _rows_jk_k.append({
+                                        "parameter":  _n,
+                                        "unit":       _unit_str,
+                                        "θ_full":     f"{_fv:+.2e}",
+                                        "SE_jack":    (f"{_se:.2e}"
+                                                        if np.isfinite(_se)
+                                                        else "—"),
+                                        "95 % CI (≈ ±1.96·SE)": (
+                                            f"[{_fv - 1.96*_se:+.2e}, "
+                                            f"{_fv + 1.96*_se:+.2e}]"
+                                            if np.isfinite(_se) else "—"),
+                                    })
+                                st.dataframe(_rows_jk_k, hide_index=True,
+                                              use_container_width=True)
+
+                                _show_inf_k = st.checkbox(
+                                    "Show per-step influence plot",
+                                    value=True,
+                                    key="_show_jk_influence_kin")
+                                if _show_inf_k:
+                                    from equilibrist_diagnostics import \
+                                        make_jackknife_figure
+                                    _x_kind_k = st.radio(
+                                        "Plot x-axis",
+                                        options=["x_value", "index"],
+                                        horizontal=True,
+                                        key="_jk_xkind_kin")
+                                    _fig_jk_k = make_jackknife_figure(
+                                        _jr_k, x_kind=_x_kind_k,
+                                        x_label="Time [s]",
+                                        title="Jackknife (leave-one-out) "
+                                              "influence")
+                                    st.pyplot(_fig_jk_k, clear_figure=False)
+                                    import io as _io_jk
+                                    _buf_jk_k = _io_jk.BytesIO()
+                                    _fig_jk_k.savefig(_buf_jk_k,
+                                                       format="png", dpi=200,
+                                                       bbox_inches="tight")
+                                    _buf_jk_k.seek(0)
+                                    _ts_jk_k = datetime.now().strftime(
+                                        "%Y%m%d_%H%M%S")
+                                    st.download_button(
+                                        "Download influence plot PNG",
+                                        data=_buf_jk_k.getvalue(),
+                                        file_name=f"Equilibrist_jackknife_"
+                                                  f"{_ts_jk_k}.png",
+                                        mime="image/png",
+                                        key="_jk_dl_kin")
+                _jk_kin_frag()
+
+            # ── v2 Monte Carlo (nuisance-parameter uncertainty, kin) ─────
+            # Parallel to the equilibrium-branch MC: samples relative
+            # uncertainties on initial concentrations and V₀, refits with
+            # the perturbed (assumed-known) values, and reports the σ
+            # contribution that bootstrap / Hessian don't see.
+            if fit_stats:
+                @_fragment
+                def _mc_kin_frag():
+                    if st.checkbox("🎲 Show Monte Carlo "
+                                   "(experimental-uncertainty propagation)",
+                                   value=False, key="_show_mc_kin",
+                                   help="For each iteration the MC samples "
+                                        "user-specified relative uncertainties "
+                                        "on initial concentrations and V₀, "
+                                        "then refits the same observed data "
+                                        "with the perturbed (assumed-known) "
+                                        "values.  The σ on the fitted rate "
+                                        "constants captures contributions from "
+                                        "experimental-prep uncertainty — "
+                                        "invisible to the residual-noise "
+                                        "bootstrap."):
+                        _fa_mc_k = st.session_state.get("_fit_args_kin")
+                        if not _fa_mc_k:
+                            st.info("Click **Fit** once with the current "
+                                    "script and data to enable Monte Carlo.")
+                        else:
+                            # Nuisance parameters for kinetics: anything in
+                            # parsed["concentrations"] not in fit_conc_keys,
+                            # plus anything in parsed["volumes"].
+                            _parsed_mc_k = _fa_mc_k.get("parsed_fit") or {}
+                            _concs_k = _parsed_mc_k.get("concentrations", {}) or {}
+                            _vols_k  = _parsed_mc_k.get("volumes",        {}) or {}
+                            _fck_k   = set(_fa_mc_k.get("fit_conc_keys", []) or [])
+                            _conc_nuis_k = [n for n in _concs_k
+                                             if (n[:-1] if n.endswith("0") else n)
+                                                 not in _fck_k]
+
+                            st.caption("Default σ = 0 % (no contribution). "
+                                       "Set realistic relative uncertainties "
+                                       "for each prep-error source. Typical "
+                                       "values: 2–3 % for gravimetric stock "
+                                       "concentrations, 0.5–1 % for "
+                                       "volumetric V₀.")
+                            _specs_k: dict = {}
+                            _all_inputs_k: list = []
+                            for _n in _conc_nuis_k:
+                                _all_inputs_k.append(("conc",
+                                                       f"{_n} (nominal "
+                                                       f"{_concs_k[_n]:.3g} mM)",
+                                                       _n))
+                            for _vn, _vv in _vols_k.items():
+                                _all_inputs_k.append(("vol",
+                                                       f"{_vn} (nominal "
+                                                       f"{_vv:.3g} mL)",
+                                                       _vn))
+
+                            if not _all_inputs_k:
+                                st.info("No nuisance parameters to sample "
+                                        "— every experimental quantity is "
+                                        "already a fit variable.")
+                            else:
+                                _ncols_inp = 2
+                                _cols_inp_k = st.columns(_ncols_inp)
+                                for _ii, (_kind, _label, _name) in enumerate(_all_inputs_k):
+                                    _col = _cols_inp_k[_ii % _ncols_inp]
+                                    _val = _col.number_input(
+                                        f"σ on {_label} (%)",
+                                        min_value=0.0, max_value=50.0,
+                                        value=0.0, step=0.1,
+                                        key=f"_mc_sig_kin_{_kind}_{_name}",
+                                        format="%.2f")
+                                    if _val > 0:
+                                        if _kind == "conc":
+                                            _specs_k[f"conc:{_name}"] = _val / 100.0
+                                        elif _kind == "vol":
+                                            _specs_k[f"vol:{_name}"]  = _val / 100.0
+
+                                _ci_n, _ci_p = st.columns([1, 1])
+                                _n_mc_k = _ci_n.number_input(
+                                    "MC iterations",
+                                    min_value=50, max_value=5000,
+                                    value=500, step=50,
+                                    key="_mc_iter_kin")
+                                _mc_par_k = _ci_p.checkbox(
+                                    "Parallel (use all cores)",
+                                    value=False, key="_mc_par_kin")
+
+                                if not _specs_k:
+                                    st.warning("All uncertainties are 0 % — "
+                                               "MC would be degenerate. "
+                                               "Set at least one σ > 0 "
+                                               "before running.")
+
+                                if st.button("Run Monte Carlo",
+                                              key="_mc_run_kin",
+                                              disabled=(not _specs_k)):
+                                    _pb_mc = st.progress(0.0, text="MC running…")
+                                    _cb_mc = lambda i, N: _pb_mc.progress(
+                                        min(i / max(N, 1), 1.0),
+                                        text=f"MC {i}/{N}")
+                                    _jobs_mc = -1 if _mc_par_k else 1
+                                    try:
+                                        _mr_k = None
+                                        if _fa_mc_k.get("use_spectra_fit"):
+                                            _mr_k = ebs.monte_carlo_kinetics_spectra(
+                                                _fa_mc_k["parsed_fit"], _fa_mc_k["start_logk"],
+                                                _fa_mc_k["spectra_data_fit"],
+                                                _fa_mc_k["fit_keys"], _fa_mc_k["t_max"],
+                                                float(_fa_mc_k.get("wl_min") or 0.0),
+                                                float(_fa_mc_k.get("wl_max") or 1e9),
+                                                nuisance_specs=_specs_k,
+                                                n_iter=int(_n_mc_k), n_jobs=_jobs_mc,
+                                                tolerance=_fa_mc_k["tolerance"], maxiter=_fa_mc_k["maxiter"],
+                                                constraints=_fa_mc_k["constraints"],
+                                                fit_conc_keys=_fa_mc_k["fit_conc_keys"],
+                                                allow_negative_eps=_fa_mc_k.get(
+                                                    "allow_neg_eps", False),
+                                                progress_callback=_cb_mc)
+                                        elif _fa_mc_k.get("use_nmr_fit") and _fa_mc_k.get("nmr_mode") == "shift":
+                                            _mr_k = ebs.monte_carlo_kinetics_nmr_shifts(
+                                                _fa_mc_k["parsed_fit"], _fa_mc_k["start_logk"],
+                                                _fa_mc_k["nmr_data_fit"],
+                                                _fa_mc_k["fit_keys"], _fa_mc_k["t_max"],
+                                                nuisance_specs=_specs_k,
+                                                n_iter=int(_n_mc_k), n_jobs=_jobs_mc,
+                                                tolerance=_fa_mc_k["tolerance"], maxiter=_fa_mc_k["maxiter"],
+                                                constraints=_fa_mc_k["constraints"],
+                                                fit_conc_keys=_fa_mc_k["fit_conc_keys"],
+                                                progress_callback=_cb_mc)
+                                        elif _fa_mc_k.get("use_nmr_fit") and _fa_mc_k.get("nmr_mode") == "integration":
+                                            _mr_k = ebs.monte_carlo_kinetics_nmr_integration(
+                                                _fa_mc_k["parsed_fit"], _fa_mc_k["start_logk"],
+                                                _fa_mc_k["nmr_data_fit"],
+                                                _fa_mc_k["fit_keys"], _fa_mc_k["t_max"],
+                                                nuisance_specs=_specs_k,
+                                                n_iter=int(_n_mc_k), n_jobs=_jobs_mc,
+                                                tolerance=_fa_mc_k["tolerance"], maxiter=_fa_mc_k["maxiter"],
+                                                constraints=_fa_mc_k["constraints"],
+                                                fit_conc_keys=_fa_mc_k["fit_conc_keys"],
+                                                progress_callback=_cb_mc)
+                                        elif _fa_mc_k.get("use_nmr_fit") and _fa_mc_k.get("nmr_mode") == "mixed":
+                                            _mr_k = ebs.monte_carlo_kinetics_nmr_mixed(
+                                                _fa_mc_k["parsed_fit"], _fa_mc_k["start_logk"],
+                                                _fa_mc_k["nmr_data_fit"],
+                                                _fa_mc_k["fit_keys"], _fa_mc_k["t_max"],
+                                                nuisance_specs=_specs_k,
+                                                n_iter=int(_n_mc_k), n_jobs=_jobs_mc,
+                                                tolerance=_fa_mc_k["tolerance"], maxiter=_fa_mc_k["maxiter"],
+                                                constraints=_fa_mc_k["constraints"],
+                                                fit_conc_keys=_fa_mc_k["fit_conc_keys"],
+                                                progress_callback=_cb_mc)
+                                        else:
+                                            _mr_k = ebs.monte_carlo_kinetics(
+                                                _fa_mc_k["parsed_fit"], _fa_mc_k["exp_data_fit"],
+                                                _fa_mc_k["start_logk"],
+                                                _fa_mc_k["fit_keys"], _fa_mc_k["t_max"],
+                                                nuisance_specs=_specs_k,
+                                                n_iter=int(_n_mc_k), n_jobs=_jobs_mc,
+                                                tolerance=_fa_mc_k["tolerance"], maxiter=_fa_mc_k["maxiter"],
+                                                constraints=_fa_mc_k["constraints"],
+                                                fit_conc_keys=_fa_mc_k["fit_conc_keys"],
+                                                progress_callback=_cb_mc)
+                                        if _mr_k is not None:
+                                            st.session_state["_mc_result_kin"] = _mr_k
+                                    except Exception as _mce_k:
+                                        _pb_mc.empty()
+                                        import traceback as _tb_mc
+                                        st.error(f"Monte Carlo failed: {_mce_k}")
+                                        st.caption(_tb_mc.format_exc())
+                                    else:
+                                        _pb_mc.empty()
+
+                            _mr_k = st.session_state.get("_mc_result_kin")
+                            if _mr_k is not None and not _mr_k.get("mc_se"):
+                                st.warning(f"Monte Carlo: "
+                                            f"{_mr_k.get('best_message', 'no result')}")
+                            if _mr_k and _mr_k.get("mc_se"):
+                                st.caption(
+                                    f"{_mr_k['n_success']}/{_mr_k['n_iter']} "
+                                    f"iterations succeeded "
+                                    f"({_mr_k['wall_seconds']:.1f} s)")
+                                _rows_mc_k = []
+                                _kinds_mc_k = _mr_k.get("param_kinds", {}) or {}
+                                for _n, _se in _mr_k["mc_se"].items():
+                                    _fv   = _mr_k["best_fit"].get(_n, float("nan"))
+                                    _kind = _kinds_mc_k.get(_n, "log")
+                                    if   _kind == "log":       _ust = "log10"
+                                    elif _kind == "linear_k":  _ust = "linear"
+                                    else:                       _ust = "mM"
+                                    _lo = _mr_k["mc_ci_lo"].get(_n, float("nan"))
+                                    _hi = _mr_k["mc_ci_hi"].get(_n, float("nan"))
+                                    _rows_mc_k.append({
+                                        "parameter": _n,
+                                        "unit":      _ust,
+                                        "θ_nominal": f"{_fv:+.2e}",
+                                        "MC σ":      (f"{_se:.2e}"
+                                                       if np.isfinite(_se) else "—"),
+                                        "95 % CI (from samples)":
+                                            (f"[{_lo:+.2e}, {_hi:+.2e}]"
+                                             if np.isfinite(_lo) and np.isfinite(_hi)
+                                             else "—"),
+                                    })
+                                st.dataframe(_rows_mc_k, hide_index=True,
+                                              use_container_width=True)
+                                st.caption("**Comparing with bootstrap σ above** "
+                                           "tells you which uncertainty source "
+                                           "dominates: residual noise (bootstrap) "
+                                           "or experimental prep error (MC).  If "
+                                           "MC σ ≳ bootstrap σ, tightening stock "
+                                           "concentrations / volume measurements "
+                                           "will improve precision more than "
+                                           "noise reduction.")
+                _mc_kin_frag()
+
+            # ── v2 Local sensitivity test (Masson/beta) — kinetics ─────
+            if fit_stats:
+                @_fragment
+                def _lst_kin_frag():
+                    if st.checkbox("🎚️ Show Local sensitivity test (Masson)",
+                                   value=False, key="_show_lst_kin",
+                                   help="Probes the local SSR surface "
+                                        "around the optimum by perturbing "
+                                        "each selected variable by ±δ "
+                                        "in log10 space.  The paired-"
+                                        "difference construction cancels "
+                                        "cross-coupling terms exactly, "
+                                        "isolating each variable's "
+                                        "intrinsic stiffness.  Compared "
+                                        "with the marginal Hessian σ, "
+                                        "the ratio diagnoses parameter "
+                                        "coupling.  3^N grid evaluations — "
+                                        "tractable up to ~6–7 selected "
+                                        "variables."):
+                        _fa_lst_k = st.session_state.get("_fit_args_kin")
+                        if not _fa_lst_k:
+                            st.info("Click **Fit** once with the current "
+                                    "script and data to enable the local "
+                                    "sensitivity test.")
+                        else:
+                            # Variable list for kinetics: rate constants
+                            # AND equilibrium constants are both in
+                            # start_logk (build_kinetics_logk_dict
+                            # includes both).  Initial concentrations
+                            # live in parsed["concentrations"], volumes
+                            # in parsed["volumes"].
+                            _all_K_k = list(_fa_lst_k.get("start_logk", {}).keys())
+                            _parsed_lst = _fa_lst_k.get("parsed_fit") or {}
+                            _all_C_k = list((_parsed_lst.get("concentrations", {}) or {}).keys())
+                            _all_V_k = list((_parsed_lst.get("volumes",        {}) or {}).keys())
+
+                            _fit_K_k = set(_fa_lst_k.get("fit_keys",      []) or [])
+                            _fit_C_k = set()
+                            for _root in (_fa_lst_k.get("fit_conc_keys", []) or []):
+                                # fit_conc_keys uses ROOT names (no
+                                # trailing 0); match against parsed
+                                # entries by stripping the suffix
+                                for _full in _all_C_k:
+                                    if (_full[:-1] if _full.endswith("0") else _full) == _root:
+                                        _fit_C_k.add(_full)
+
+                            st.caption("Pick the variables to include "
+                                       "in the test. Fitted parameters "
+                                       "are checked by default; any "
+                                       "held-fixed quantity can also be "
+                                       "tested.")
+
+                            _selected_k: list = []
+                            if _all_K_k:
+                                st.write("**Rate / equilibrium constants**")
+                                _cKk = st.columns(min(3, max(1, len(_all_K_k))))
+                                for _ii, _n in enumerate(_all_K_k):
+                                    if _cKk[_ii % len(_cKk)].checkbox(
+                                            _n, value=(_n in _fit_K_k),
+                                            key=f"_lst_kin_chk_K_{_n}"):
+                                        _selected_k.append(_n)
+                            if _all_C_k:
+                                st.write("**Initial concentrations**")
+                                _cCk = st.columns(min(3, max(1, len(_all_C_k))))
+                                for _ii, _n in enumerate(_all_C_k):
+                                    if _cCk[_ii % len(_cCk)].checkbox(
+                                            _n, value=(_n in _fit_C_k),
+                                            key=f"_lst_kin_chk_C_{_n}"):
+                                        _selected_k.append(_n)
+                            if _all_V_k:
+                                st.write("**Volumes**")
+                                _cVk = st.columns(min(3, max(1, len(_all_V_k))))
+                                for _ii, _n in enumerate(_all_V_k):
+                                    if _cVk[_ii % len(_cVk)].checkbox(
+                                            _n, value=False,
+                                            key=f"_lst_kin_chk_V_{_n}"):
+                                        _selected_k.append(_n)
+
+                            _csz_k, _cpar_k = st.columns([1, 1])
+                            _step_lst_k = _csz_k.number_input(
+                                "Step δ (log10 units)",
+                                min_value=0.001, max_value=1.0,
+                                value=0.10, step=0.01, format="%.3f",
+                                key="_lst_kin_step")
+                            _par_lst_k = _cpar_k.checkbox(
+                                "Parallel (use all cores)",
+                                value=True, key="_lst_kin_par")
+
+                            _N = len(_selected_k)
+                            if _N == 0:
+                                st.warning("Select at least one variable "
+                                           "to include in the test.")
+                                _can_run = False
+                            else:
+                                n_grid = 3 ** _N
+                                if _N >= 8:
+                                    st.error(f"⚠ {_N} variables → 3^{_N} = "
+                                              f"{n_grid:,} evaluations. "
+                                              "That's likely too slow "
+                                              "even parallel. Consider "
+                                              "deselecting some.")
+                                elif _N >= 6:
+                                    st.warning(f"⚠ {_N} variables → 3^{_N} "
+                                                f"= {n_grid:,} grid "
+                                                "points — expect several "
+                                                "minutes.")
+                                else:
+                                    st.caption(f"Grid: 3^{_N} = {n_grid:,} "
+                                                "RMSE evaluations.")
+                                _can_run = True
+
+                            if st.button("Run local sensitivity test",
+                                          key="_lst_kin_run",
+                                          disabled=not _can_run):
+                                _pb = st.progress(0.0, text="Local sensitivity running…")
+                                _cb = lambda i, N: _pb.progress(
+                                    min(i / max(N, 1), 1.0),
+                                    text=f"Local sensitivity {i}/{N}")
+                                _jobs = -1 if _par_lst_k else 1
+                                _pe = fit_stats.get("param_errors", {}) or {}
+                                _sigma_marg = {k: float(v) for k, v in _pe.items()
+                                                if v is not None and np.isfinite(v)}
+                                try:
+                                    _lr = compute_local_sensitivity(
+                                        _fa_lst_k, _selected_k,
+                                        step=float(_step_lst_k),
+                                        n_jobs=_jobs,
+                                        sigma_marg=_sigma_marg,
+                                        fit_stats=fit_stats,
+                                        progress_callback=_cb)
+                                    if _lr is not None:
+                                        st.session_state["_lst_result_kin"] = _lr
+                                except Exception as _le:
+                                    _pb.empty()
+                                    import traceback as _tb_lst
+                                    st.error(f"Local sensitivity failed: {_le}")
+                                    st.caption(_tb_lst.format_exc())
+                                else:
+                                    _pb.empty()
+
+                            _lr = st.session_state.get("_lst_result_kin")
+                            if _lr is not None and _lr.get("f"):
+                                st.caption(
+                                    f"{_lr['n_success']}/{_lr['n_grid']} "
+                                    f"grid points evaluated "
+                                    f"({_lr['wall_seconds']:.1f} s, "
+                                    f"N_data = {_lr['n_data']}, "
+                                    f"RMSE_opt = {_lr['rmse_opt']:.3e})")
+                                _rows = []
+                                for _v in _lr["selected_vars"]:
+                                    _f  = _lr["f"].get(_v, float("nan"))
+                                    _sc = _lr["sigma_cond"].get(_v, float("nan"))
+                                    _sm = _lr["sigma_marg"].get(_v, float("nan"))
+                                    _cp = _lr["coupling"].get(_v, float("nan"))
+                                    if   np.isnan(_cp):    _cp_tag = "n/a"
+                                    elif _cp <= 1.5:       _cp_tag = f"{_cp:.2f} ✓"
+                                    elif _cp <= 3.0:       _cp_tag = f"{_cp:.2f} ⚠"
+                                    else:                  _cp_tag = f"{_cp:.2f} ⚠⚠"
+                                    _rows.append({
+                                        "variable": _v,
+                                        "ξ (% RMSE per ±δ)":
+                                            (f"{_f*100:+.2f}%"
+                                              if np.isfinite(_f) else "—"),
+                                        "σ_cond (log10)":
+                                            (f"{_sc:.2e}" if np.isfinite(_sc) else "—"),
+                                        "σ_marg (Hessian, log10)":
+                                            (f"{_sm:.2e}" if np.isfinite(_sm) else "—"),
+                                        "Coupling factor":
+                                            _cp_tag,
+                                    })
+                                st.dataframe(_rows, hide_index=True,
+                                              use_container_width=True)
+                                st.caption(
+                                    "**σ_cond** is the conditional CI "
+                                    "half-width (other variables held "
+                                    "fixed); **σ_marg** is the marginal "
+                                    "Hessian σ (other variables free to "
+                                    "refit).  **Coupling factor** = "
+                                    "σ_marg / σ_cond ≥ 1: ≤ 1.5 means "
+                                    "the variable is independently "
+                                    "constrained by the data; 1.5–3.0 "
+                                    "indicates mild coupling; > 3 "
+                                    "signals that the variable is "
+                                    "mostly identified through coupling "
+                                    "with another, and its individual "
+                                    "value should be interpreted "
+                                    "cautiously.")
+                                # Per-variable expandable diff table
+                                _drecs = _lr.get("diff_records", {})
+                                if _drecs:
+                                    with st.expander("Show individual paired differences"):
+                                        for _v in _lr["selected_vars"]:
+                                            _records = _drecs.get(_v, [])
+                                            if not _records: continue
+                                            st.markdown(f"**{_v}** — "
+                                                        f"{len(_records)} paired diffs, "
+                                                        f"mean = {_lr['f'].get(_v, float('nan'))*100:+.3f}%")
+                                            _drows = []
+                                            for _rec in _records:
+                                                _sign_lbl = ("+δ" if _rec["sign"] > 0 else "−δ")
+                                                _other_str = ", ".join(
+                                                    f"{k}={v}" for k, v in _rec["others"].items())
+                                                _drows.append({
+                                                    f"sign of δ_{_v}": _sign_lbl,
+                                                    "other variables": _other_str or "—",
+                                                    "RMSE (unp.)":  f"{_rec.get('rmse_unp', float('nan')):.6e}",
+                                                    "RMSE (pert.)": f"{_rec.get('rmse_pert', float('nan')):.6e}",
+                                                    "diff r (%)": f"{_rec['diff']*100:+.4f}%",
+                                                })
+                                            st.dataframe(_drows, hide_index=True,
+                                                          use_container_width=True)
+                _lst_kin_frag()
+
+            # ── v2 model comparison (AIC / BIC / F-test / Akaike weights) ────
+            if fit_stats:
+                @_fragment
+                def _cmp_kin_frag():
+                    if st.checkbox("⚖️ Show model comparison (AIC / BIC / F-test)",
+                                   value=False, key="_show_cmp_kin"):
+                        st.caption(
+                            "Fit an alternative kinetic model on the same "
+                            "experimental data and rank the two by information "
+                            "criteria.  Akaike weights translate ΔAIC into an "
+                            "evidence ratio (w_A / w_B = exp(ΔAIC / 2)).  Tick "
+                            "**Nested?** when the simpler model is a special "
+                            "case of the more complex one (e.g. single-step vs "
+                            "two-step) to enable the F-test.")
+                        _fa_k = st.session_state.get("_fit_args_kin")
+                        _alt_script_k = st.text_area(
+                            "Alternative kinetic model script",
+                            height=180, key="_alt_script_text_kin",
+                            placeholder=(
+                                "$concentrations\n"
+                                "A0 = 1.00 mM\n\n"
+                                "$volumes\nV0 = 500 uL\n\n"
+                                "$reactions\n"
+                                "A → B;   log k1 = -2.0\n"
+                                "B → C;   log k2 = -3.0\n\n"
+                                "$plot\nxmax = 1000\nx = t\ny = A, B, C"))
+                        _nested_k = st.checkbox(
+                            "Nested? (enables F-test)", value=True,
+                            key="_alt_nested_kin")
+                        if st.button("Fit alternative & compare",
+                                     key="_alt_compare_btn_kin"):
+                            if not _fa_k:
+                                st.warning("Click **Fit** with the current "
+                                           "script first.")
+                            elif not _alt_script_k.strip():
+                                st.warning("Paste an alternative kinetic "
+                                           "model above.")
+                            else:
+                                try:
+                                    _alt_p_k = parse_script(_alt_script_k)
+                                    _alt_logK_k = {
+                                        **{e["kname"]: float(e["logK"])
+                                           for e in _alt_p_k.get("equilibria", [])},
+                                        **{r["kname"]: float(r["log_k"])
+                                           for r in _alt_p_k.get("kinetics", [])},
+                                        **{r["krname"]: float(r["log_kr"])
+                                           for r in _alt_p_k.get("kinetics", [])
+                                           if "krname" in r},
+                                    }
+                                    _alt_keys_k = list(_alt_logK_k.keys())
+                                    _t_max_k    = float(_fa_k["t_max"])
+                                    _tol_k      = float(_fa_k["tolerance"])
+                                    _mxi_k      = int(_fa_k["maxiter"])
+                                    _cstr_k     = _alt_p_k.get("constraints", [])
+                                    with st.spinner("Fitting alternative kinetic model…"):
+                                        if _fa_k["use_spectra_fit"]:
+                                            _ok2, _f2, _s2, _m2 = fit_kinetics_spectra(
+                                                _alt_p_k, _alt_logK_k,
+                                                _fa_k["spectra_data_fit"],
+                                                _alt_keys_k,
+                                                t_max=_t_max_k, n_pts=200,
+                                                tolerance=_tol_k, maxiter=_mxi_k,
+                                                constraints=_cstr_k)
+                                        elif _fa_k["use_nmr_fit"] and _fa_k["nmr_mode"] == "shift":
+                                            _ok2, _f2, _s2, _m2 = fit_kinetics_nmr_shifts(
+                                                _alt_p_k, _alt_logK_k,
+                                                _fa_k["nmr_data_fit"], _alt_keys_k,
+                                                _fa_k["x_expr"],
+                                                t_max=_t_max_k, n_pts=200,
+                                                tolerance=_tol_k, maxiter=_mxi_k,
+                                                constraints=_cstr_k)
+                                        elif _fa_k["use_nmr_fit"] and _fa_k["nmr_mode"] == "integration":
+                                            _ok2, _f2, _s2, _m2 = fit_kinetics_nmr_integration(
+                                                _alt_p_k, _alt_logK_k,
+                                                _fa_k["nmr_data_fit"], _alt_keys_k,
+                                                _fa_k["x_expr"],
+                                                t_max=_t_max_k, n_pts=200,
+                                                tolerance=_tol_k, maxiter=_mxi_k,
+                                                constraints=_cstr_k)
+                                        elif _fa_k["use_nmr_fit"] and _fa_k["nmr_mode"] == "mixed":
+                                            _ok2, _f2, _s2, _m2 = fit_kinetics_nmr_mixed(
+                                                _alt_p_k, _alt_logK_k,
+                                                _fa_k["nmr_data_fit"], _alt_keys_k,
+                                                _fa_k["x_expr"],
+                                                t_max=_t_max_k, n_pts=200,
+                                                tolerance=_tol_k, maxiter=_mxi_k,
+                                                constraints=_cstr_k)
+                                        else:
+                                            _ok2, _f2, _s2, _m2 = fit_kinetics(
+                                                _alt_p_k, _fa_k["exp_data_fit"] or {},
+                                                _alt_logK_k, _alt_keys_k,
+                                                _t_max_k, 200, _tol_k, _mxi_k,
+                                                constraints=_cstr_k)
+                                    if not _ok2:
+                                        st.warning(f"Alternative model did not "
+                                                   f"converge: {_m2}")
+                                    else:
+                                        augment_stats(_s2)
+                                        st.session_state["_alt_stats_kin"]  = _s2
+                                        st.session_state["_alt_fitted_kin"] = dict(_f2)
+                                except Exception as _ce:
+                                    import traceback as _tb_c
+                                    st.error(f"Model comparison failed: {_ce}")
+                                    st.caption(_tb_c.format_exc())
+                        # Render last comparison if available
+                        _s2 = st.session_state.get("_alt_stats_kin")
+                        _f2 = st.session_state.get("_alt_fitted_kin")
+                        if _s2 and fit_stats.get("aic") is not None and _s2.get("aic") is not None:
+                            cmp = compare_models(fit_stats, _s2, nested=_nested_k,
+                                                 label_a="Current", label_b="Alternative")
+                            st.markdown(f"**{cmp['interpretation']}**")
+                            _kA = fit_stats.get('n_params', 0) or 0   # = p (manuscript convention)
+                            _kB = _s2.get('n_params', 0) or 0         # = p (manuscript convention)
+                            _crows = [
+                                {"Metric": "ℓ_max",
+                                 "Current":     f"{fit_stats.get('log_likelihood', float('nan')):.3f}",
+                                 "Alternative": f"{_s2.get('log_likelihood',  float('nan')):.3f}",
+                                 "Δ (Alt − Cur)": f"{_s2.get('log_likelihood', 0)-fit_stats.get('log_likelihood', 0):+.3f}"},
+                                {"Metric": "SSR",
+                                 "Current":     f"{fit_stats.get('ssr', float('nan')):.5g}",
+                                 "Alternative": f"{_s2.get('ssr',  float('nan')):.5g}",
+                                 "Δ (Alt − Cur)": f"{_s2.get('ssr', 0)-fit_stats.get('ssr', 0):+.5g}"},
+                                {"Metric": "p (fitted)",
+                                 "Current": f"{_kA}", "Alternative": f"{_kB}",
+                                 "Δ (Alt − Cur)": f"{_kB - _kA:+d}"},
+                                {"Metric": "AIC",
+                                 "Current":     f"{cmp['aic_a']:.2f}",
+                                 "Alternative": f"{cmp['aic_b']:.2f}",
+                                 "Δ (Alt − Cur)": f"{cmp['delta_aic']:+.2f}"},
+                                {"Metric": "AICc",
+                                 "Current":     f"{cmp['aicc_a']:.2f}",
+                                 "Alternative": f"{cmp['aicc_b']:.2f}",
+                                 "Δ (Alt − Cur)": f"{cmp['delta_aicc']:+.2f}"},
+                                {"Metric": "BIC",
+                                 "Current":     f"{cmp['bic_a']:.2f}",
+                                 "Alternative": f"{cmp['bic_b']:.2f}",
+                                 "Δ (Alt − Cur)": f"{cmp['delta_bic']:+.2f}"},
+                            ]
+                            st.dataframe(_crows, hide_index=True)
+                            st.markdown(
+                                f"**Akaike weights**: "
+                                f"Current = **{cmp['weight_a']:.3f}** · "
+                                f"Alternative = **{cmp['weight_b']:.3f}**  \n"
+                                f"_(weight ≈ probability this model is the better of the two)_")
+                            if _nested_k and np.isfinite(cmp['f_statistic']):
+                                _dp = abs(_kB - _kA)
+                                if cmp['f_statistic'] == 0.0 and cmp['f_p_value'] == 1.0:
+                                    st.markdown(
+                                        f"**F-test** (Δp = {_dp}): the more "
+                                        "complex model does *not* reduce SSR "
+                                        "→ no evidence whatsoever for the "
+                                        "additional parameter(s).")
+                                else:
+                                    st.markdown(
+                                        f"**F-test** (Δp = {_dp}): "
+                                        f"F = {cmp['f_statistic']:.3f}, "
+                                        f"p = {cmp['f_p_value']:.4g}")
+                            # Show alternative model's fitted parameters
+                            if _f2:
+                                st.markdown("**Alternative model fitted constants:**")
+                                _alt_rows = []
+                                for n_alt, v_alt in _f2.items():
+                                    _e_alt = _s2.get('param_errors', {}).get(n_alt)
+                                    _alt_rows.append({
+                                        "Parameter": n_alt,
+                                        "log K/k": f"{v_alt:+.4f}",
+                                        "± σ (Hessian)": (f"{_e_alt:.4f}"
+                                                          if _e_alt is not None and np.isfinite(_e_alt)
+                                                          else "—"),
+                                    })
+                                st.dataframe(_alt_rows, hide_index=True)
+
+                _cmp_kin_frag()
 
             # ── Fitted rate constants (k and ±k only, no log) ────────────
             param_values     = fit_stats.get("param_values", {})
@@ -1765,14 +3997,29 @@ if IS_KINETICS:
 
             # ── Pure-species chemical shifts (shift / mixed) ──────────────
             pure_shifts_disp = fit_stats.get("pure_shifts", {})
+            # Display rule:
+            #   • Default (no noref):       show absolute δ = δ_obs(t_free) + dd
+            #     (same behavior as legacy app; dd_ref = 0 by auto-pin so the
+            #     reference column shows the V=0 observed shift).
+            #   • noref WITH read: anchor:  show absolute δ (scale anchored).
+            #   • noref WITHOUT read::      show Δδ relative to math reference;
+            #     absolute scale is undetermined (uniform-shift symmetry).
+            _nmr_noref   = bool(fit_stats.get("nmr_noref", False))
+            _ps_anchored = bool(fit_stats.get("pure_shifts_anchored", False))
+            _show_abs    = (not _nmr_noref) or _ps_anchored
+            _ps_dfree    = fit_stats.get("delta_free", {}) or {}
             if pure_shifts_disp:
-                st.write("**Pure-species chemical shifts (ppm):**")
+                if _show_abs:
+                    st.write("**Pure-species chemical shifts (ppm):**")
+                else:
+                    st.write("**Pure-species chemical shifts — Δδ relative to math reference (ppm):**")
                 all_sp_cols = []; rows_ps = []
                 for tgt, col_dict in pure_shifts_disp.items():
                     for col, sp_dict in col_dict.items():
                         row = {"Signal": col}
-                        for sp, delta in sp_dict.items():
-                            row[sp] = f"{delta:.4f}"
+                        df0 = float(_ps_dfree.get(col, 0.0)) if _show_abs else 0.0
+                        for sp, dd_val in sp_dict.items():
+                            row[sp] = f"{df0 + dd_val:.4f}"
                             if sp not in all_sp_cols:
                                 all_sp_cols.append(sp)
                         rows_ps.append(row)
@@ -1780,7 +4027,11 @@ if IS_KINETICS:
                     df_ps = pd.DataFrame(rows_ps).set_index("Signal")
                     ordered = [c for c in all_sp_cols if c in df_ps.columns]
                     st.dataframe(df_ps[ordered], width='stretch')
-                    st.caption("Each row = one NMR signal; columns = δ of each pure species (ppm)")
+                    if _show_abs:
+                        st.caption("Each row = one NMR signal; columns = δ of each pure species (ppm)")
+                    else:
+                        st.caption("Each row = one NMR signal; columns = Δδ relative to math reference (ppm). "
+                                   "Add a `read:` anchor in $nmr to recover absolute δ.")
 
             if _kin_fit_mode == "mixed":
                 integ_sp   = list(sp_concs_disp.keys())
@@ -2121,17 +4372,19 @@ if st.session_state.pop("_fit_requested", False):
                 parsed.get("constraints", []) if _this_fit_constrained else []
             )
 
-            # If constraints changed state, reset to script defaults so the
-            # optimizer starts from a point that satisfies (or at least doesn't
-            # badly violate) the constraints.
-            # Also reset to script defaults when fitting concentrations: the sidebar
-            # logK values may be far from the true optimum at the script A0, causing
-            # L-BFGS-B to push A0 to its boundary before logK can adjust.
+            # When fitting concentrations, reset to script defaults: the sidebar
+            # logK values may be far from the true optimum at the script A0,
+            # causing L-BFGS-B to push A0 to its boundary before logK can adjust.
+            #
+            # The constraint toggle flipping does NOT trigger a reset.  The
+            # sidebar K's (typically the previous fit's output) are usually a
+            # much better starting point than script defaults, even if they
+            # violate the soft constraint slightly — the penalty term will
+            # pull them onto the constraint surface in the first few iterations.
+            # Resetting to script defaults forced the optimizer to re-discover
+            # the basin from scratch, often hitting the timeout.
             _script_defaults_eq = {eq["kname"]: eq["logK"] for eq in parsed["equilibria"]}
-            if _this_fit_constrained != _last_fit_constrained:
-                _start_logK = {k: _script_defaults_eq.get(k, v) for k, v in logK_vals.items()}
-            else:
-                _start_logK = logK_vals
+            _start_logK = logK_vals
 
             st.session_state["_last_fit_was_constrained"] = _this_fit_constrained
 
@@ -2204,7 +4457,66 @@ if st.session_state.pop("_fit_requested", False):
                 st.session_state[f"_pending_conc_{root}"] = float(mM_val)
             for tkey, mM_val in stats.get("fitted_titrants", {}).items():
                 st.session_state[f"_pending_titrant_mM_{tkey}"] = float(mM_val)
+            # ── v2: canonicalise param_values across ALL fit modes ──────
+            # fit_conc populates stats["param_values"] internally, but
+            # the NMR / spectra modules don't.  Mirror fitted_logKs into
+            # stats["param_values"] so downstream diagnostics (Local
+            # sensitivity test in particular) have a single source of
+            # truth for the optimum, regardless of which fit module ran.
+            if isinstance(stats, dict):
+                stats.setdefault("param_values", dict(fitted_logKs))
+            # Reset diagnostic toggles + cached results so the user opts
+            # back in for the new fit (stale "show ..." plots were a
+            # real-world confusion from earlier sessions).
+            # Also bump the fit-counter — the parent diag-panel
+            # checkbox uses this as a key suffix so Streamlit's
+            # fragment-internal widget cache can't keep it stuck
+            # checked across fits.
+            st.session_state["_fit_counter"] = int(
+                st.session_state.get("_fit_counter", 0)) + 1
+            _reset_diagnostic_toggles()
             st.session_state["_fit_stats"] = stats
+            # ── v2: save fit args so the bootstrap UI can find them after rerun ──
+            st.session_state["_fit_args_eq"] = {
+                "kind":              "eq",
+                "fit_keys":          list(fit_keys_end),
+                "fit_conc_keys":     list(fit_conc_keys_end),
+                "fit_titrant_keys":  list(fit_titrant_keys_end),
+                "use_spectra_fit":   bool(use_spectra_fit),
+                "use_nmr_fit":       bool(use_nmr_fit),
+                "nmr_mode":          (nmr_cfg_fit["mode"] if use_nmr_fit and nmr_cfg_fit else None),
+                "wl_min":            (float(wl_min_fit) if use_spectra_fit else None),
+                "wl_max":            (float(wl_max_fit) if use_spectra_fit else None),
+                "tolerance":         float(tolerance),
+                "maxiter":           int(maxiter),
+                "constraints":       _active_constraints,
+                "start_logK":        dict(_start_logK),
+                "start_logk":        dict(_start_logK),  # alias for profile dispatcher
+                "x_expr":            x_expr,
+                "exp_data_fit":      exp_data_fit     if not (use_nmr_fit or use_spectra_fit) else None,
+                "nmr_data_fit":      nmr_data_fit     if use_nmr_fit     else None,
+                "spectra_data_fit":  spectra_data_fit if use_spectra_fit else None,
+                "allow_neg_eps":     bool(allow_neg_eps) if use_spectra_fit else False,
+                "parsed_fit":        parsed,
+                "network":           network,
+                "params":            params,
+                # n_data: needed by the local-sensitivity test to
+                # turn f-values into conditional σ via δ/√(2·N·f).
+                "n_data":            int(stats.get("n_points", 0)),
+            }
+            # ── Augment stats with AIC/BIC + residuals (v2 diagnostics) ──
+            try:
+                _final_logK = dict(_start_logK); _final_logK.update(fitted_logKs)
+                # Unified collector reads y_obs/y_calc/residuals + per-col arrays
+                # populated by all v2-patched fit modes — works uniformly for
+                # conc, NMR-shift, NMR-integration, NMR-mixed, and spectra fits.
+                # ``x_expr`` is passed so the residuals-vs-predictor axis label
+                # matches the script's plot directive (e.g. "H0/G0").
+                _res = collect_residuals_from_stats(stats, x_expr=x_expr_default)
+                augment_stats(stats, _res)
+                st.session_state["_fit_residuals"] = _res
+            except Exception:
+                st.session_state["_fit_residuals"] = {}
             _n_evals = stats.get("n_iter", 0)
             _n_fitted = len(fitted_logKs) + len(stats.get("fitted_concs", {})) + len(stats.get("fitted_titrants", {}))
             if stats.get("timed_out"):
@@ -3062,8 +5374,13 @@ with col2:
     )
     if _uploaded is not None:
         try:
+            _raw_bytes = _uploaded.read()
+            # Capture raw bytes + filename in session_state so the
+            # "Save session" feature can bundle the data verbatim.
+            st.session_state["_exp_data_bytes"]    = _raw_bytes
+            st.session_state["_exp_data_filename"] = _uploaded.name
             if parsed.get("spectra") is not None:
-                _loaded = load_spectra_data(_uploaded.read())
+                _loaded = load_spectra_data(_raw_bytes)
                 st.session_state["_spectra_data"] = _loaded
                 st.session_state.pop("_outliers_spectra", None)
                 # Override xmax with the x-value of the last data point
@@ -3075,7 +5392,7 @@ with col2:
                         x_col_header=_loaded.get("x_col_header", ""))[0]
                     st.session_state["_pending_xmax"] = float(np.ceil(_x_last * 10) / 10)
             elif nmr_cfg is not None:
-                _loaded = load_experimental_data(_uploaded.read())
+                _loaded = load_experimental_data(_raw_bytes)
                 st.session_state["_nmr_data"] = _loaded
                 st.session_state.pop("_outliers_nmr", None)
                 # Update xmax from last data point (x-axis in mL, converted via x_expr)
@@ -3088,7 +5405,7 @@ with col2:
                         x_col_header=_loaded.get("_x_col_header", ""))[0]
                     st.session_state["_pending_xmax"] = float(np.ceil(_x_last_nmr * 10) / 10)
             else:
-                _loaded = load_experimental_data(_uploaded.read())
+                _loaded = load_experimental_data(_raw_bytes)
                 st.session_state["_exp_data"] = _loaded
                 st.session_state.pop("_outliers_main", None)
                 _eq_cols = [c for c in _loaded if not c.startswith("_")]
@@ -3130,31 +5447,9 @@ with col2:
     fit_stats = st.session_state.get("_fit_stats", {})
     if fit_stats:
         fit_mode_disp = fit_stats.get("fit_mode", "")
-        st.write("**Fit Statistics:**")
 
-        if fit_mode_disp == "mixed":
-            # Show per-component stats — never mix mM and ppm into one number
-            r2_i    = fit_stats.get("r2_integ", 0.0)
-            rmse_i  = fit_stats.get("rmse_integ", 0.0)
-            n_i     = fit_stats.get("n_integ_pts", 0)
-            r2_s    = fit_stats.get("r2_shift", 0.0)
-            rmse_s  = fit_stats.get("rmse_shift", 0.0)
-            n_s     = fit_stats.get("n_shift_pts", 0)
-            st.write(f"**Integration fit** ({n_i} points)")
-            st.write(f"• R² = {r2_i:.4f}")
-            st.write(f"• RMSE = {rmse_i:.2e} mM")
-            st.write(f"**Shift fit** ({n_s} points)")
-            st.write(f"• R² = {r2_s:.4f}")
-            st.write(f"• RMSE = {rmse_s:.2e} ppm")
-            n_total_disp = fit_stats.get("n_points", n_i + n_s)
-            st.write(f"• Total data points: {n_total_disp}")
-            if n_total_disp > fit_stats.get("n_params", 0):
-                st.write(f"• Parameters fitted: {fit_stats.get('n_params', '?')}")
-            if "n_iter" in fit_stats:
-                _evals = fit_stats["n_iter"]
-                st.write(f"• Objective evaluations: {_evals}")
-        elif fit_mode_disp == "spectra":
-            # ── Timeout / correlation warnings ─────────────────
+        # ── Warnings stay OUTSIDE the collapsible (always visible) ────
+        if fit_mode_disp == "spectra":
             if fit_stats.get("timed_out"):
                 st.warning(
                     "⏱️ **Fit timed out** — showing best parameters found within "
@@ -3174,36 +5469,1518 @@ with col2:
                         warn_lines.append(f"- **{label}** = {val:.3f} ± {se:.3f}  "
                                           f"(eigenvalue ratio {ratio:.2e})")
                 st.warning("\n".join(warn_lines))
-            # ── Standard stats ──────────────────────────────────
-            st.write(f"• RMSE = {fit_stats['rmse']:.2e} AU")
-            if fit_stats.get("r2_conc") is not None:
-                st.write(f"• Concentration R² = {fit_stats['r2_conc']:.4f}  "
-                         f"*(data points vs theoretical traces)*")
-                st.write(f"• Concentration RMSE = {fit_stats['rmse_conc']:.2e} mM")
-            st.write(f"• Data points: {fit_stats['n_points']} (spectra × wavelengths)")
-            if fit_stats['n_points'] > fit_stats['n_params']:
-                reduced_chi2 = fit_stats['ssr'] / (fit_stats['n_points'] - fit_stats['n_params'])
-                st.write(f"• Reduced χ² = {reduced_chi2:.2e}")
-            _wl_fit = fit_stats.get("wavelengths_fit", np.array([]))
-            if len(_wl_fit) > 0:
-                if fit_stats.get("auto_range"):
-                    st.write(f"• Auto-optimized range: {fit_stats['opt_wl_min']:.0f}–{fit_stats['opt_wl_max']:.0f} nm")
+
+        # ── Basic fit statistics (collapsible) ────────────────────────
+        # All the simple goodness-of-fit numbers (R², RMSE, χ²,
+        # AIC/BIC, DW/Shapiro) tucked behind a checkbox so the default
+        # post-fit view shows just the fitted-constants table.  Same
+        # hierarchy as "Show residual diagnostics".
+        @_fragment
+        def _stats_eq_frag():
+            if st.checkbox("🔢 Show fit statistics",
+                           value=False, key="_show_stats_eq",
+                           help="R², RMSE, reduced χ², information "
+                                "criteria (AIC/BIC), and residual "
+                                "tests (Durbin–Watson, Shapiro–Wilk)."):
+                if fit_mode_disp == "mixed":
+                    # Show per-component stats — never mix mM and ppm into one number
+                    r2_i    = fit_stats.get("r2_integ", 0.0)
+                    rmse_i  = fit_stats.get("rmse_integ", 0.0)
+                    n_i     = fit_stats.get("n_integ_pts", 0)
+                    r2_s    = fit_stats.get("r2_shift", 0.0)
+                    rmse_s  = fit_stats.get("rmse_shift", 0.0)
+                    n_s     = fit_stats.get("n_shift_pts", 0)
+                    st.write(f"**Integration fit** ({n_i} points)")
+                    st.write(f"• R² = {r2_i:.4f}")
+                    st.write(f"• RMSE = {rmse_i:.2e} mM")
+                    st.write(f"**Shift fit** ({n_s} points)")
+                    st.write(f"• R² = {r2_s:.4f}")
+                    st.write(f"• RMSE = {rmse_s:.2e} ppm")
+                    n_total_disp = fit_stats.get("n_points", n_i + n_s)
+                    st.write(f"• Total data points: {n_total_disp}")
+                    if n_total_disp > fit_stats.get("n_params", 0):
+                        st.write(f"• Parameters fitted: {fit_stats.get('n_params', '?')}")
+                    if "n_iter" in fit_stats:
+                        _evals = fit_stats["n_iter"]
+                        st.write(f"• Objective evaluations: {_evals}")
+                elif fit_mode_disp == "spectra":
+                    # Warnings already shown above the collapsible — only stats here
+                    st.write(f"• RMSE = {fit_stats['rmse']:.2e} AU")
+                    if fit_stats.get("r2_conc") is not None:
+                        st.write(f"• Concentration R² = {fit_stats['r2_conc']:.4f}  "
+                                 f"*(data points vs theoretical traces)*")
+                        st.write(f"• Concentration RMSE = {fit_stats['rmse_conc']:.2e} mM")
+                    st.write(f"• Data points: {fit_stats['n_points']} (spectra × wavelengths)")
+                    if fit_stats['n_points'] > fit_stats['n_params']:
+                        reduced_chi2 = fit_stats['ssr'] / (fit_stats['n_points'] - fit_stats['n_params'])
+                        st.write(f"• Reduced χ² = {reduced_chi2:.2e}")
+                    _wl_fit = fit_stats.get("wavelengths_fit", np.array([]))
+                    if len(_wl_fit) > 0:
+                        if fit_stats.get("auto_range"):
+                            st.write(f"• Auto-optimized range: {fit_stats['opt_wl_min']:.0f}–{fit_stats['opt_wl_max']:.0f} nm")
+                        else:
+                            st.write(f"• Fit range: {_wl_fit[0]:.0f}–{_wl_fit[-1]:.0f} nm")
+                    if "n_iter" in fit_stats:
+                        _evals = fit_stats["n_iter"]
+                        st.write(f"• Objective evaluations: {_evals}")
                 else:
-                    st.write(f"• Fit range: {_wl_fit[0]:.0f}–{_wl_fit[-1]:.0f} nm")
-            if "n_iter" in fit_stats:
-                _evals = fit_stats["n_iter"]
-                st.write(f"• Objective evaluations: {_evals}")
-        else:
-            st.write(f"• R² = {fit_stats['r_squared']:.4f}")
-            rmse_unit = " ppm" if fit_mode_disp == "shift" else " mM" if fit_mode_disp == "integration" else ""
-            st.write(f"• RMSE = {fit_stats['rmse']:.2e}{rmse_unit}")
-            st.write(f"• Data points: {fit_stats['n_points']}")
-            if fit_stats['n_points'] > fit_stats['n_params']:
-                reduced_chi2 = fit_stats['ssr'] / (fit_stats['n_points'] - fit_stats['n_params'])
-                st.write(f"• Reduced χ² = {reduced_chi2:.2e}")
-            if "n_iter" in fit_stats:
-                _evals = fit_stats["n_iter"]
-                st.write(f"• Objective evaluations: {_evals}")
+                    st.write(f"• R² = {fit_stats['r_squared']:.4f}")
+                    rmse_unit = " ppm" if fit_mode_disp == "shift" else " mM" if fit_mode_disp == "integration" else ""
+                    st.write(f"• RMSE = {fit_stats['rmse']:.2e}{rmse_unit}")
+                    st.write(f"• Data points: {fit_stats['n_points']}")
+                    if fit_stats['n_points'] > fit_stats['n_params']:
+                        reduced_chi2 = fit_stats['ssr'] / (fit_stats['n_points'] - fit_stats['n_params'])
+                        st.write(f"• Reduced χ² = {reduced_chi2:.2e}")
+                    if "n_iter" in fit_stats:
+                        _evals = fit_stats["n_iter"]
+                        st.write(f"• Objective evaluations: {_evals}")
+
+                # ── v2 diagnostics: AIC / BIC / Durbin–Watson / Shapiro ──
+                if "aic" in fit_stats and np.isfinite(fit_stats.get("aic", float("nan"))):
+                    st.write(f"• AIC = {fit_stats['aic']:.2f}   |   "
+                             f"AICc = {fit_stats['aicc']:.2f}   |   "
+                             f"BIC = {fit_stats['bic']:.2f}")
+                if "durbin_watson" in fit_stats and np.isfinite(fit_stats.get("durbin_watson", float("nan"))):
+                    _dw = fit_stats["durbin_watson"]; _sp = fit_stats.get("shapiro_p")
+                    _dw_note = "✓" if 1.5 <= _dw <= 2.5 else "⚠ autocorrelation suspected"
+                    _sp_note = ("normal" if (_sp is not None and np.isfinite(_sp) and _sp >= 0.05)
+                                else "non-normal" if (_sp is not None and np.isfinite(_sp)) else "")
+                    _sp_disp = f"; Shapiro p = {_sp:.3f} ({_sp_note})" if (_sp is not None and np.isfinite(_sp)) else ""
+                    st.write(f"• Durbin–Watson = {_dw:.2f} ({_dw_note}){_sp_disp}")
+                    # Spectra-mode caveat: residuals are concatenated across
+                    # many spectra × many wavelengths, and adjacent entries
+                    # are the same spectrum at adjacent wavelengths —
+                    # correlated by bandpass / baseline drift / spectral
+                    # smoothness.  DW (which assumes independent samples)
+                    # will read as autocorrelated and Shapiro p will be
+                    # tiny essentially every time, regardless of fit
+                    # quality.  Show the numbers (they're still computed),
+                    # but flag that they are not diagnostically meaningful
+                    # for this mode — the informative view is the
+                    # residual-vs-predictor panel, not the DW / SW values.
+                    if "spectra" in str(fit_stats.get("fit_mode", "")):
+                        st.caption(
+                            "ℹ Spectra mode: residuals are wavelength-correlated by "
+                            "spectrometer bandpass, baseline drift, and spectral "
+                            "smoothness, so Durbin–Watson and Shapiro–Wilk are not "
+                            "diagnostically meaningful (DW will read low and Shapiro "
+                            "p will be tiny regardless of fit quality). The "
+                            "informative view is the residuals-vs-predictor panel."
+                        )
+        _stats_eq_frag()
+
+        # ── v2 diagnostics: residual panel (expander) ────────────────────
+        _res_eq = st.session_state.get("_fit_residuals")
+        if fit_stats and _res_eq and len(_res_eq.get("y_obs", [])) > 0:
+            @_fragment
+            def _diag_eq_frag():
+                # The parent checkbox uses a key that incorporates the
+                # fit-counter so Streamlit treats it as a fresh widget
+                # on each new fit, side-stepping the fragment's
+                # internal widget-state cache which otherwise keeps
+                # the parent stuck "checked" even after the public
+                # session_state entry has been cleared.
+                _n_eq = int(st.session_state.get("_fit_counter", 0))
+                if st.checkbox("📊 Show residual diagnostics",
+                               value=False,
+                               key=f"_show_diag_eq_{_n_eq}"):
+                    # ── Parameter correlation heatmap (linear/Hessian) ──
+                    _show_corr_e = _indented_checkbox(
+                        "🔗 Show parameter correlation heatmap",
+                        value=False, key="_show_corr_eq",
+                        help="Pearson ρ derived from the Hessian "
+                             "covariance.  Strong off-diagonal entries "
+                             "(|ρ| > 0.9) mean the Hessian standard "
+                             "errors understate the true uncertainty.  "
+                             "Compare against the 2D RMSE profile for "
+                             "the nonlinear view.")
+                    if _show_corr_e:
+                        try:
+                            from equilibrist_diagnostics import \
+                                make_correlation_heatmap
+                            _figh = make_correlation_heatmap(
+                                fit_stats,
+                                title="Parameter correlation matrix")
+                            st.pyplot(_figh, clear_figure=False)
+                            import io as _io
+                            _bufh = _io.BytesIO()
+                            _figh.savefig(_bufh, format="png", dpi=200,
+                                          bbox_inches="tight")
+                            _bufh.seek(0)
+                            _tsh = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            st.download_button(
+                                "Download correlation heatmap PNG",
+                                data=_bufh.getvalue(),
+                                file_name=f"Equilibrist_corr_{_tsh}.png",
+                                mime="image/png",
+                                key="_corr_dl_eq")
+                        except Exception as _ce:
+                            st.error(f"Correlation heatmap failed: {_ce}")
+
+                    # ── Parameter identifiability — sloppy spectrum ──
+                    # Multi-parameter generalisation of the correlation
+                    # heatmap.  See companion comment in the kinetics
+                    # block (line ~2287) for the rationale.
+                    _show_ident_e = _indented_checkbox(
+                        "🔬 Show parameter identifiability "
+                        "(sloppy spectrum)",
+                        value=False, key="_show_ident_eq",
+                        help="Eigendecomposition of the Hessian "
+                             "covariance.  Spread of σᵢ across many "
+                             "decades = sloppy model — some parameter "
+                             "combinations are unconstrained by the "
+                             "data.  Brown & Sethna 2003; Gutenkunst "
+                             "et al. 2007; Hibbert & Thordarson 2016.")
+                    if _show_ident_e:
+                        try:
+                            render_identifiability_panel(
+                                fit_stats, key="ident_eq")
+                        except Exception as _ie:
+                            st.error(f"Identifiability analysis failed: {_ie}")
+
+                    # ── Parameter significance — t-test ──────────────
+                    # Per-parameter (θ̂ − θ₀) / SE, p-value from
+                    # Student's t with df = n − p.  The user can
+                    # override θ₀ per row via the editable column
+                    # (default 0, which for log K means K = 1, and
+                    # for log conc means c = 1 mM — handy sanity
+                    # check).  Cheap to compute and complements the
+                    # heatmap by reporting the *significance* of each
+                    # estimate rather than its correlation with others.
+                    _show_ttest_e = _indented_checkbox(
+                        "📐 Show parameter significance (t-test)",
+                        value=False, key="_show_ttest_eq",
+                        help="t = (θ̂ − θ₀) / SE, two-tailed p-value "
+                             "from Student's t with df = n − p.  "
+                             "Estimates and SE are in log10 units; "
+                             "edit the Null column to test against "
+                             "literature values (e.g. log K = 4.5).")
+                    if _show_ttest_e:
+                        try:
+                            from equilibrist_diagnostics import \
+                                compute_param_t_tests
+                            _nul_key_e = "_ttest_nulls_eq"
+                            _nul_overrides_e = st.session_state.get(
+                                _nul_key_e, {})
+                            _rows_e = compute_param_t_tests(
+                                fit_stats, _nul_overrides_e)
+                            if not _rows_e:
+                                st.info("No fitted parameters with "
+                                        "standard errors available.")
+                            else:
+                                import pandas as _pd
+                                _names_e = [r["name"] for r in _rows_e]
+                                st.session_state["_ttest_names_eq"] = _names_e
+
+                                def _on_ttest_eq_change():
+                                    # Runs BEFORE the next rerun's
+                                    # script body — see kinetics branch
+                                    # for the rationale.
+                                    _state = st.session_state.get(
+                                        "_ttest_editor_eq", {}) or {}
+                                    _ed_rows = _state.get(
+                                        "edited_rows", {}) or {}
+                                    if not _ed_rows:
+                                        return
+                                    _names = st.session_state.get(
+                                        "_ttest_names_eq", [])
+                                    _nulls = dict(st.session_state.get(
+                                        "_ttest_nulls_eq", {}))
+                                    for _ri, _ch in _ed_rows.items():
+                                        try:
+                                            _i = int(_ri)
+                                            if (_i < len(_names)
+                                                    and "Null θ₀" in _ch):
+                                                _nulls[_names[_i]] = float(_ch["Null θ₀"])
+                                        except (ValueError, TypeError, KeyError):
+                                            pass
+                                    st.session_state["_ttest_nulls_eq"] = _nulls
+
+                                _df_e = _pd.DataFrame(_rows_e)
+                                _df_disp_e = _pd.DataFrame({
+                                    "Parameter":      _df_e["name"],
+                                    "Kind":           _df_e["kind"],
+                                    "Estimate (log)": _df_e["value"].round(4),
+                                    "SE (log)":       _df_e["se"].round(4),
+                                    "Null θ₀":        _df_e["null"].round(4),
+                                    "t":              _df_e["t"].round(2),
+                                    "p":              _df_e["p"].map(
+                                        lambda v: f"{v:.2e}" if _pd.notna(v) else "n/a"),
+                                    "Sig":            _df_e["stars"],
+                                })
+                                st.data_editor(
+                                    _df_disp_e,
+                                    column_config={
+                                        "Parameter":      st.column_config.TextColumn(disabled=True),
+                                        "Kind":           st.column_config.TextColumn(disabled=True),
+                                        "Estimate (log)": st.column_config.NumberColumn(disabled=True, format="%.4f"),
+                                        "SE (log)":       st.column_config.NumberColumn(disabled=True, format="%.4f"),
+                                        "Null θ₀":        st.column_config.NumberColumn(
+                                                              required=True,
+                                                              format="%.4f",
+                                                              help="θ₀ used for the t-test.  "
+                                                                   "Edit to compare against a "
+                                                                   "literature value (in log "
+                                                                   "units).  Default 0."),
+                                        "t":              st.column_config.NumberColumn(disabled=True, format="%.2f"),
+                                        "p":              st.column_config.TextColumn(disabled=True),
+                                        "Sig":            st.column_config.TextColumn(disabled=True,
+                                                              help="*** p<0.001, ** p<0.01, "
+                                                                   "* p<0.05, n.s. otherwise"),
+                                    },
+                                    hide_index=True,
+                                    use_container_width=True,
+                                    on_change=_on_ttest_eq_change,
+                                    key="_ttest_editor_eq")
+                                if _rows_e and _rows_e[0]["df"] > 0:
+                                    st.caption(
+                                        f"Degrees of freedom: "
+                                        f"df = {_rows_e[0]['df']} "
+                                        f"(n − p). Estimates and SE "
+                                        f"shown in log10 units.")
+                        except Exception as _te:
+                            st.error(f"t-test failed: {_te}")
+
+                    # ── Rank analysis (EFA / scree / TFA) ────────────
+                    # Data-space diagnostic: where the three checkboxes
+                    # above ask whether the *fitted parameters* are
+                    # well-determined, this one asks whether the *data*
+                    # supports the rank (= number of distinguishable
+                    # species) implied by the chemical model.  Only
+                    # available for fit modes that produce a multi-
+                    # channel data matrix D (UV-Vis spectra; multi-
+                    # signal NMR shift / integration).  For modes
+                    # without D the checkbox is hidden.
+                    if fit_stats.get("data_matrix") is not None:
+                        _show_rank_e = _indented_checkbox(
+                            "📊 Show data-rank analysis "
+                            "(EFA / scree / TFA)",
+                            value=False, key="_show_rank_eq",
+                            help="Evolving Factor Analysis + Malinowski "
+                                 "IND + Target Factor Analysis on the "
+                                 "data matrix D = C·E^T.  EFA reveals "
+                                 "when each species' contribution "
+                                 "rises above the noise floor; IND "
+                                 "recommends a rank; TFA projects each "
+                                 "fitted pure spectrum onto the data's "
+                                 "factor space to check that the "
+                                 "fitted ε is actually supported by the "
+                                 "data.  Maeder & Zuberbühler 1986; "
+                                 "Malinowski 1991.")
+                        if _show_rank_e:
+                            try:
+                                render_rank_analysis_panel(
+                                    fit_stats, key="rank_eq")
+                            except Exception as _re:
+                                st.error(f"Rank analysis failed: {_re}")
+
+                    # Optional RMSE parameter profile (Musketeer §4.4
+                    # style).  Expensive — refits at every grid point
+                    # for every fitted parameter — so it's behind a
+                    # checkbox and cached in session_state.
+                    _show_prof = _indented_checkbox(
+                        "🔍 Show parameter profile (RMSE vs each "
+                        "parameter)",
+                        value=False, key="_show_prof_eq",
+                        help="For each fitted parameter, pins it at a "
+                             "grid of values around the optimum and "
+                             "refits the others.  Sharp valleys = "
+                             "well-determined parameter; flat regions "
+                             "= unidentifiable.")
+                    _prof = None
+                    if _show_prof:
+                        _fa = st.session_state.get("_fit_args_eq")
+                        if not _fa:
+                            st.info("Click **Fit** first to enable "
+                                    "the parameter profile.")
+                        else:
+                            col_a, col_b = st.columns(2)
+                            _p_span = col_a.number_input(
+                                "Span (log units, ±)", min_value=0.1,
+                                max_value=3.0, value=0.5, step=0.1,
+                                key="_prof_span_eq")
+                            _p_npts = col_b.number_input(
+                                "Grid points (odd)", min_value=5,
+                                max_value=51, value=11, step=2,
+                                key="_prof_npts_eq")
+                            _prof_par = st.checkbox(
+                                "Parallel (use all cores)",
+                                value=False, key="_prof_par_eq",
+                                help="Run independent grid-point refits "
+                                     "in parallel via joblib.  Speeds up "
+                                     "large profiles roughly linearly "
+                                     "with core count.")
+                            _prof_jobs = -1 if _prof_par else 1
+                            # Cache key intentionally omits the fitted
+                            # ``param_values`` tuple — see kinetics
+                            # branch for the rationale (every new fit
+                            # already invalidates this cache, and the
+                            # tuple was fragile across JSON save/load).
+                            _cache_key = ("_prof_cache_eq",
+                                          float(_p_span), int(_p_npts))
+                            _cached = st.session_state.get(_cache_key)
+                            if _cached is not None:
+                                _prof = _cached
+                            else:
+                                if st.button("Compute profile",
+                                             key="_prof_btn_eq"):
+                                    _bar = st.progress(0.0,
+                                        text="Computing profile…")
+                                    def _cb(f, m):
+                                        try:
+                                            _bar.progress(min(1.0, f),
+                                                          text=m)
+                                        except Exception:
+                                            pass
+                                    try:
+                                        _fa_eq_prof = dict(_fa)
+                                        _fa_eq_prof["kind"] = "eq"
+                                        _prof = compute_rmse_profile(
+                                            _fa_eq_prof,
+                                            fit_stats.get("param_values", {}),
+                                            span=float(_p_span),
+                                            n_pts=int(_p_npts),
+                                            fitted_concs_mM=fit_stats.get("fitted_concs"),
+                                            fitted_titrants_mM=fit_stats.get("fitted_titrants"),
+                                            n_jobs=_prof_jobs,
+                                            progress_callback=_cb)
+                                        _write_tuple_cache(_cache_key, _prof)
+                                        _bar.empty()
+                                    except Exception as _pe:
+                                        _bar.empty()
+                                        st.error(f"Profile failed: {_pe}")
+                    render_diagnostics_panel(fit_stats, _res_eq,
+                                             key="diag_eq",
+                                             rmse_profile=_prof)
+
+                    # ── 2D RMSE profile (pairwise) — equilibrium ─────
+                    _show_p2d_e = _indented_checkbox(
+                        "🌐 Show 2D parameter profile "
+                        "(RMSE colormap for a pair)",
+                        value=False, key="_show_p2d_eq",
+                        help="At each (X, Y) grid point both "
+                             "parameters are pinned and every OTHER "
+                             "free parameter is refit.  Long diagonal "
+                             "valleys = strong pairwise correlation; "
+                             "round wells = independently identified.")
+                    if _show_p2d_e:
+                        _fa_e_for2d = st.session_state.get("_fit_args_eq")
+                        if not _fa_e_for2d:
+                            st.info("Click **Fit** first to enable "
+                                    "the 2D profile.")
+                        else:
+                            _cands = {}
+                            for _n, _v in (fit_stats.get(
+                                    "param_values", {}) or {}).items():
+                                try: _cands[_n] = float(_v)
+                                except Exception: pass
+                            for _n, _mM in (fit_stats.get(
+                                    "fitted_concs", {}) or {}).items():
+                                try:
+                                    _v = float(_mM)
+                                    if _v > 0:
+                                        _cands[_n] = float(np.log10(_v))
+                                except Exception: pass
+                            for _n, _mM in (fit_stats.get(
+                                    "fitted_titrants", {}) or {}).items():
+                                try:
+                                    _v = float(_mM)
+                                    if _v > 0:
+                                        _cands[_n] = float(np.log10(_v))
+                                except Exception: pass
+                            _names = list(_cands.keys())
+                            if len(_names) < 2:
+                                st.info("Need at least 2 fitted "
+                                        "parameters to build a 2D "
+                                        "profile.")
+                            else:
+                                if len(_names) == 2:
+                                    _p1_e, _p2_e = _names[0], _names[1]
+                                    st.caption(f"Auto-selected: "
+                                               f"**{_p1_e}** vs **{_p2_e}** "
+                                               "(only two fitted).")
+                                else:
+                                    c1, c2 = st.columns(2)
+                                    _p1_e = c1.selectbox(
+                                        "X-axis parameter", _names,
+                                        index=0, key="_p2d_p1_eq")
+                                    _p2_e = c2.selectbox(
+                                        "Y-axis parameter", _names,
+                                        index=1, key="_p2d_p2_eq")
+                                c_sx, c_sy, c_np = st.columns(3)
+                                _sx_e = c_sx.number_input(
+                                    "Span X (log ±)", min_value=0.1,
+                                    max_value=3.0, value=0.5, step=0.1,
+                                    key="_p2d_sx_eq")
+                                _sy_e = c_sy.number_input(
+                                    "Span Y (log ±)", min_value=0.1,
+                                    max_value=3.0, value=0.5, step=0.1,
+                                    key="_p2d_sy_eq")
+                                _np_e = c_np.number_input(
+                                    "Grid (per axis, odd)",
+                                    min_value=5, max_value=31,
+                                    value=11, step=2,
+                                    key="_p2d_np_eq")
+                                _par2_e = st.checkbox(
+                                    "Parallel (use all cores)",
+                                    value=True, key="_p2d_par_eq",
+                                    help="Strongly recommended — "
+                                         "2D scans run n_pts² refits.")
+                                _p2d_jobs_e = -1 if _par2_e else 1
+                                if _p1_e == _p2_e:
+                                    st.warning("Pick two **different** "
+                                               "parameters.")
+                                else:
+                                    # Cache key omits the per-fit
+                                    # parameter-value tuple — see
+                                    # kinetics branch for rationale.
+                                    _ck = ("_p2d_cache_eq", _p1_e, _p2_e,
+                                           float(_sx_e), float(_sy_e),
+                                           int(_np_e))
+                                    _cached2 = st.session_state.get(_ck)
+                                    if _cached2 is not None:
+                                        _scan2 = _cached2
+                                    else:
+                                        _scan2 = None
+                                        if st.button(
+                                                "Compute 2D profile",
+                                                key="_p2d_btn_eq"):
+                                            _bar2 = st.progress(0.0,
+                                                text="Computing 2D profile…")
+                                            def _cb2(f, m):
+                                                try: _bar2.progress(min(1.0, f), text=m)
+                                                except Exception: pass
+                                            try:
+                                                _fa_e_prof2 = dict(_fa_e_for2d)
+                                                _fa_e_prof2["kind"] = "eq"
+                                                _scan2 = compute_rmse_profile_2d(
+                                                    _fa_e_prof2,
+                                                    _p1_e, _cands[_p1_e],
+                                                    _p2_e, _cands[_p2_e],
+                                                    span_x=float(_sx_e),
+                                                    span_y=float(_sy_e),
+                                                    n_pts_x=int(_np_e),
+                                                    n_pts_y=int(_np_e),
+                                                    n_jobs=_p2d_jobs_e,
+                                                    progress_callback=_cb2)
+                                                _write_tuple_cache(_ck, _scan2)
+                                                _bar2.empty()
+                                            except Exception as _e2:
+                                                _bar2.empty()
+                                                st.error(f"2D profile failed: {_e2}")
+                                    if _scan2 is not None:
+                                        try:
+                                            _fig2 = make_2d_profile_figure(
+                                                _scan2,
+                                                title=f"2D RMSE profile: "
+                                                      f"{_p1_e} vs {_p2_e}",
+                                                param_cov=fit_stats.get("param_cov"),
+                                                cov_names=fit_stats.get("param_cov_names"),
+                                                constraints=_fa_e_for2d.get("constraints"))
+                                            st.pyplot(_fig2, clear_figure=False)
+                                            import io as _io
+                                            _buf2 = _io.BytesIO()
+                                            _fig2.savefig(_buf2, format="png",
+                                                          dpi=200,
+                                                          bbox_inches="tight")
+                                            _buf2.seek(0)
+                                            _ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            st.download_button(
+                                                "Download 2D profile PNG",
+                                                data=_buf2.getvalue(),
+                                                file_name=f"Equilibrist_2Dprofile_"
+                                                          f"{_p1_e}_{_p2_e}_{_ts2}.png",
+                                                mime="image/png",
+                                                key="_p2d_dl_eq")
+                                        except Exception as _re:
+                                            st.error(f"Could not render 2D "
+                                                     f"figure: {_re}")
+            _diag_eq_frag()
+
+        # ── v2 bootstrap CIs (toggle, in fragment) ───────────────────────
+        if fit_stats:
+            @_fragment
+            def _bs_eq_frag():
+                if st.checkbox("🔁 Show bootstrap confidence intervals",
+                               value=False, key="_show_bs_eq"):
+                    st.caption("Resamples fit residuals to estimate CIs without "
+                               "assuming Gaussian errors. Recommended when "
+                               "Shapiro p < 0.05 above. Each iteration is a full refit.")
+                    _fa = st.session_state.get("_fit_args_eq")
+                    if not _fa:
+                        st.info("Click **Fit** once with the current script and data "
+                                "to enable bootstrap.  (The bootstrap reuses the exact "
+                                "configuration of the most recent fit.)")
+                    else:
+                        _bs_n   = st.number_input("Iterations", min_value=20, max_value=10000,
+                                                  value=200, step=50, key="_bs_n_eq")
+                        _bs_mth = st.selectbox("Resampling method",
+                                               ["residual", "parametric", "wild"],
+                                               index=0, key="_bs_mth_eq")
+                        _bs_par = st.checkbox("Parallel (use all cores)",
+                                              value=False, key="_bs_par_eq")
+                        if st.button("Run bootstrap", key="_bs_run_eq"):
+                            _pb = st.progress(0.0, text="Bootstrap running…")
+                            _cb = lambda i, N: _pb.progress(min(i / max(N,1), 1.0),
+                                                            text=f"Bootstrap {i}/{N}")
+                            _jobs = -1 if _bs_par else 1
+                            try:
+                                if _fa["use_spectra_fit"]:
+                                    _r = ebs.bootstrap_spectra(
+                                        _fa["parsed_fit"], _fa["network"], _fa["spectra_data_fit"],
+                                        _fa["params"], _fa["start_logK"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        wl_min=_fa["wl_min"], wl_max=_fa["wl_max"],
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        timeout_s=float(st.session_state.get("fit_timeout", 30)),
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        fit_titrant_keys=_fa["fit_titrant_keys"],
+                                        allow_negative_eps=_fa.get("allow_neg_eps", False),
+                                        progress_callback=_cb)
+                                elif _fa["use_nmr_fit"] and _fa["nmr_mode"] == "shift":
+                                    _r = ebs.bootstrap_nmr_shift(
+                                        _fa["parsed_fit"], _fa["network"], _fa["nmr_data_fit"],
+                                        _fa["params"], _fa["start_logK"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        fit_titrant_keys=_fa["fit_titrant_keys"],
+                                        progress_callback=_cb)
+                                elif _fa["use_nmr_fit"] and _fa["nmr_mode"] == "integration":
+                                    _r = ebs.bootstrap_nmr_integ(
+                                        _fa["parsed_fit"], _fa["network"], _fa["nmr_data_fit"],
+                                        _fa["params"], _fa["start_logK"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        fit_titrant_keys=_fa["fit_titrant_keys"],
+                                        progress_callback=_cb)
+                                elif _fa["use_nmr_fit"] and _fa["nmr_mode"] == "mixed":
+                                    _r = ebs.bootstrap_nmr_mixed(
+                                        _fa["parsed_fit"], _fa["network"], _fa["nmr_data_fit"],
+                                        _fa["params"], _fa["start_logK"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        fit_titrant_keys=_fa["fit_titrant_keys"],
+                                        progress_callback=_cb)
+                                else:
+                                    _exp = _fa["exp_data_fit"] or {}
+                                    _xcol = _exp.get("_x_col_header", "")
+                                    _r = ebs.bootstrap_conc(
+                                        _fa["parsed_fit"], _fa["network"], _exp, _fa["params"],
+                                        _fa["start_logK"],
+                                        _fa["fit_keys"], _fa["x_expr"],
+                                        n_bootstrap=int(_bs_n), method=_bs_mth,
+                                        n_jobs=_jobs, seed=42,
+                                        tolerance=_fa["tolerance"], maxiter=_fa["maxiter"],
+                                        constraints=_fa["constraints"],
+                                        fit_conc_keys=_fa["fit_conc_keys"],
+                                        fit_titrant_keys=_fa["fit_titrant_keys"],
+                                        x_col_header=_xcol,
+                                        progress_callback=_cb)
+                                _pb.empty()
+                                st.session_state["_bs_result_eq"] = _r
+                            except Exception as _bse:
+                                _pb.empty()
+                                import traceback as _tb_bs
+                                st.error(f"Bootstrap failed: {_bse}")
+                                st.caption(_tb_bs.format_exc())
+                        _br = st.session_state.get("_bs_result_eq")
+                        if _br and _br.get("ci"):
+                            st.caption(f"{_br['n_success']}/{_br['n_bootstrap']} bootstrap "
+                                       f"fits converged ({_br['wall_seconds']:.1f}s; "
+                                       f"method = {_br['method']})")
+                            # ── Multi-level CIs always shown ──
+                            # Bootstrap samples (raw resamples) live in
+                            # _br["samples"] so the four standard
+                            # percentile intervals (50/80/95/99 %, the
+                            # SupraFit / SIVVU convention) are computed
+                            # on the fly.  Columns ordered widest →
+                            # narrowest so the eye moves from the
+                            # conservative interval to the tight one.
+                            _levels_eq = [99, 95, 80, 50]
+                            _samples_eq = _br.get("samples") or {}
+                            _rows = []
+                            for _n in _br["ci"].keys():
+                                _pt = _br["best_fit"].get(_n, float("nan"))
+                                _s = np.asarray(_samples_eq.get(_n, []),
+                                                dtype=float)
+                                _s = _s[np.isfinite(_s)]
+                                _row = {"parameter": _n,
+                                        "point":  f"{_pt:+.4f}",
+                                        "median": (f"{np.median(_s):+.4f}"
+                                                    if _s.size else "—"),
+                                        "σ":      (f"{np.std(_s, ddof=1):.4f}"
+                                                    if _s.size > 1 else "—")}
+                                for _lvl in _levels_eq:
+                                    if _s.size:
+                                        _alpha = 1.0 - _lvl / 100.0
+                                        _lo, _hi = np.quantile(
+                                            _s, [_alpha/2, 1 - _alpha/2])
+                                        _row[f"{_lvl} % CI"] = \
+                                            f"[{_lo:+.4f}, {_hi:+.4f}]"
+                                    else:
+                                        _row[f"{_lvl} % CI"] = "—"
+                                _rows.append(_row)
+                            st.dataframe(_rows, hide_index=True,
+                                          use_container_width=True)
+            _bs_eq_frag()
+
+        # ── v2 jackknife (leave-one-out) ─────────────────────────────────
+        # Refits the model N times each dropping one data point in turn.
+        # Yields a jackknife SE per parameter and a per-point influence
+        # signal that reveals which observations the fit is most sensitive
+        # to.  Complementary to the bootstrap: bootstrap quantifies how
+        # uncertainty in the data propagates; jackknife identifies *which*
+        # individual observations are doing the most work.  Currently
+        # prototyped for NMR-shift fits; extending to the other modes is
+        # mechanical once the UX is approved.
+        if fit_stats:
+            @_fragment
+            def _jk_eq_frag():
+                if st.checkbox("🪛 Show jackknife (leave-one-out) analysis",
+                               value=False, key="_show_jk_eq",
+                               help="For each refit the jackknife "
+                                    "removes one full titration step "
+                                    "— that is, all signal columns "
+                                    "(or all wavelengths for UV\u2013Vis "
+                                    "spectra; all observed species at "
+                                    "one time for kinetics) at one "
+                                    "x-value, simultaneously."):
+                    _fa_jk = st.session_state.get("_fit_args_eq")
+                    if not _fa_jk:
+                        st.info("Click **Fit** once with the current "
+                                "script and data to enable jackknife.")
+                    else:
+                        _jk_par = st.checkbox("Parallel (use all cores)",
+                                               value=False, key="_jk_par_eq")
+                        if st.button("Run jackknife", key="_jk_run_eq"):
+                            _pb_jk = st.progress(0.0,
+                                                  text="Jackknife running…")
+                            _cb_jk = lambda i, N: _pb_jk.progress(
+                                min(i / max(N, 1), 1.0),
+                                text=f"Jackknife {i}/{N}")
+                            _jobs_jk = -1 if _jk_par else 1
+                            _to_s = float(st.session_state.get(
+                                "fit_timeout", 30))
+                            try:
+                                _jr = None
+                                if _fa_jk.get("use_spectra_fit"):
+                                    _jr = ebs.jackknife_spectra(
+                                        _fa_jk["parsed_fit"], _fa_jk["network"],
+                                        _fa_jk["spectra_data_fit"],
+                                        _fa_jk["params"], _fa_jk["start_logK"],
+                                        _fa_jk["fit_keys"],
+                                        _fa_jk["x_expr"],
+                                        wl_min=_fa_jk["wl_min"],
+                                        wl_max=_fa_jk["wl_max"],
+                                        n_jobs=_jobs_jk,
+                                        tolerance=_fa_jk["tolerance"],
+                                        maxiter=_fa_jk["maxiter"],
+                                        timeout_s=_to_s,
+                                        constraints=_fa_jk["constraints"],
+                                        fit_conc_keys=_fa_jk["fit_conc_keys"],
+                                        fit_titrant_keys=_fa_jk["fit_titrant_keys"],
+                                        allow_negative_eps=_fa_jk.get(
+                                            "allow_neg_eps", False),
+                                        progress_callback=_cb_jk)
+                                elif (_fa_jk.get("use_nmr_fit")
+                                       and _fa_jk.get("nmr_mode") == "shift"):
+                                    _jr = ebs.jackknife_nmr_shift(
+                                        _fa_jk["parsed_fit"], _fa_jk["network"], _fa_jk["nmr_data_fit"],
+                                        _fa_jk["params"], _fa_jk["start_logK"],
+                                        _fa_jk["fit_keys"], _fa_jk["x_expr"],
+                                        n_jobs=_jobs_jk,
+                                        tolerance=_fa_jk["tolerance"],
+                                        maxiter=_fa_jk["maxiter"],
+                                        constraints=_fa_jk["constraints"],
+                                        fit_conc_keys=_fa_jk["fit_conc_keys"],
+                                        fit_titrant_keys=_fa_jk["fit_titrant_keys"],
+                                        progress_callback=_cb_jk)
+                                elif (_fa_jk.get("use_nmr_fit")
+                                       and _fa_jk.get("nmr_mode") == "integration"):
+                                    _jr = ebs.jackknife_nmr_integration(
+                                        _fa_jk["parsed_fit"], _fa_jk["network"], _fa_jk["nmr_data_fit"],
+                                        _fa_jk["params"], _fa_jk["start_logK"],
+                                        _fa_jk["fit_keys"], _fa_jk["x_expr"],
+                                        n_jobs=_jobs_jk,
+                                        tolerance=_fa_jk["tolerance"],
+                                        maxiter=_fa_jk["maxiter"],
+                                        constraints=_fa_jk["constraints"],
+                                        fit_conc_keys=_fa_jk["fit_conc_keys"],
+                                        fit_titrant_keys=_fa_jk["fit_titrant_keys"],
+                                        progress_callback=_cb_jk)
+                                elif (_fa_jk.get("use_nmr_fit")
+                                       and _fa_jk.get("nmr_mode") == "mixed"):
+                                    _jr = ebs.jackknife_nmr_mixed(
+                                        _fa_jk["parsed_fit"], _fa_jk["network"], _fa_jk["nmr_data_fit"],
+                                        _fa_jk["params"], _fa_jk["start_logK"],
+                                        _fa_jk["fit_keys"], _fa_jk["x_expr"],
+                                        n_jobs=_jobs_jk,
+                                        tolerance=_fa_jk["tolerance"],
+                                        maxiter=_fa_jk["maxiter"],
+                                        constraints=_fa_jk["constraints"],
+                                        fit_conc_keys=_fa_jk["fit_conc_keys"],
+                                        fit_titrant_keys=_fa_jk["fit_titrant_keys"],
+                                        progress_callback=_cb_jk)
+                                else:
+                                    # Default to CONC mode for equilibrium fits
+                                    _jr = ebs.jackknife_conc(
+                                        _fa_jk["parsed_fit"], _fa_jk["network"], _fa_jk["exp_data_fit"],
+                                        _fa_jk["params"], _fa_jk["start_logK"],
+                                        _fa_jk["fit_keys"], _fa_jk["x_expr"],
+                                        n_jobs=_jobs_jk,
+                                        tolerance=_fa_jk["tolerance"],
+                                        maxiter=_fa_jk["maxiter"],
+                                        use_lbfgsb=_fa_jk.get("use_lbfgsb", True),
+                                        use_neldermead=_fa_jk.get("use_neldermead", True),
+                                        constraints=_fa_jk["constraints"],
+                                        fit_conc_keys=_fa_jk["fit_conc_keys"],
+                                        fit_titrant_keys=_fa_jk["fit_titrant_keys"],
+                                        progress_callback=_cb_jk)
+                                if _jr is not None:
+                                    st.session_state["_jk_result_eq"] = _jr
+                            except Exception as _jke:
+                                _pb_jk.empty()
+                                import traceback as _tb_jk
+                                st.error(f"Jackknife failed: {_jke}")
+                                st.caption(_tb_jk.format_exc())
+                            else:
+                                _pb_jk.empty()
+
+                        _jr = st.session_state.get("_jk_result_eq")
+                        if _jr is not None and not _jr.get("jack_se"):
+                            # Result exists but produced no usable
+                            # estimates — surface why instead of staying
+                            # silent.
+                            _msg = (_jr.get("best_message")
+                                     or "Jackknife produced no estimates "
+                                        "(0 successful refits).")
+                            st.warning(f"Jackknife: {_msg}")
+                        if _jr and _jr.get("jack_se"):
+                            st.caption(f"{_jr['n_success']}/{_jr['n_jack']} "
+                                       f"refits successful "
+                                       f"({_jr['wall_seconds']:.1f}s)")
+                            # Summary table: param | unit | full | SE_jack
+                            # The unit column makes clear that θ_full and
+                            # SE_jack are in log10 space for K/k parameters
+                            # and linear mM for fitted concentrations and
+                            # titrants — the same convention as the
+                            # influence plot below.
+                            _rows_jk = []
+                            _kinds_eq = _jr.get("param_kinds", {}) or {}
+                            for _n, _se in _jr["jack_se"].items():
+                                _fv = _jr["best_fit"].get(_n, float("nan"))
+                                _kind = _kinds_eq.get(_n, "log")
+                                if   _kind == "log":       _unit_str = "log10"
+                                elif _kind == "linear_k":  _unit_str = "linear"
+                                else:                       _unit_str = "mM"
+                                _rows_jk.append({
+                                    "parameter":  _n,
+                                    "unit":       _unit_str,
+                                    "θ_full":     f"{_fv:+.2e}",
+                                    "SE_jack":    (f"{_se:.2e}"
+                                                    if np.isfinite(_se)
+                                                    else "—"),
+                                    "95 % CI (≈ ±1.96·SE)": (
+                                        f"[{_fv - 1.96*_se:+.2e}, "
+                                        f"{_fv + 1.96*_se:+.2e}]"
+                                        if np.isfinite(_se)
+                                        else "—"),
+                                })
+                            st.dataframe(_rows_jk, hide_index=True,
+                                          use_container_width=True)
+
+                            # Influence plot toggle
+                            _show_inf = st.checkbox(
+                                "Show per-point influence plot",
+                                value=True, key="_show_jk_influence_eq",
+                                help="Δ = θ_full − θ_drop for each data "
+                                     "point.  Dashed lines at ±2·SE_jack "
+                                     "flag influential observations.")
+                            if _show_inf:
+                                from equilibrist_diagnostics import \
+                                    make_jackknife_figure
+                                _x_kind = st.radio(
+                                    "Plot x-axis",
+                                    options=["x_value", "index"],
+                                    horizontal=True,
+                                    key="_jk_xkind_eq",
+                                    help="x_value: actual x-coordinate "
+                                         "(useful when most influential "
+                                         "points cluster around the "
+                                         "equivalence region).  index: "
+                                         "iteration order (useful when "
+                                         "signals overlap on x).")
+                                _fig_jk = make_jackknife_figure(
+                                    _jr, x_kind=_x_kind,
+                                    x_label=_fa_jk.get("x_expr", "x"),
+                                    title="Jackknife (leave-one-out) "
+                                          "influence")
+                                st.pyplot(_fig_jk, clear_figure=False)
+                                import io as _io
+                                _buf_jk = _io.BytesIO()
+                                _fig_jk.savefig(_buf_jk, format="png",
+                                                 dpi=200,
+                                                 bbox_inches="tight")
+                                _buf_jk.seek(0)
+                                _ts_jk = datetime.now().strftime(
+                                    "%Y%m%d_%H%M%S")
+                                st.download_button(
+                                    "Download influence plot PNG",
+                                    data=_buf_jk.getvalue(),
+                                    file_name=f"Equilibrist_jackknife_"
+                                              f"{_ts_jk}.png",
+                                    mime="image/png",
+                                    key="_jk_dl_eq")
+            _jk_eq_frag()
+
+        # ── v2 Monte Carlo (nuisance-parameter uncertainty) ──────────────
+        # Unlike bootstrap (which captures noise sensitivity), Monte Carlo
+        # here samples uncertainty in the *experimentally-fixed* values —
+        # stock concentrations, V₀ — and propagates them through the fit.
+        # The MC σ shows how much of the final precision on each fitted
+        # constant is attributable to those experimental-prep errors, a
+        # contribution invisible to the Hessian, bootstrap, or jackknife.
+        if fit_stats:
+            @_fragment
+            def _mc_eq_frag():
+                if st.checkbox("🎲 Show Monte Carlo "
+                               "(experimental-uncertainty propagation)",
+                               value=False, key="_show_mc_eq",
+                               help="For each iteration the MC samples "
+                                    "user-specified relative uncertainties "
+                                    "on stock concentrations and V₀, then "
+                                    "refits the same observed data with "
+                                    "the perturbed (assumed-known) values. "
+                                    "The σ on the fitted constants is the "
+                                    "contribution from experimental-prep "
+                                    "uncertainty — invisible to the "
+                                    "residual-noise bootstrap."):
+                    _fa_mc = st.session_state.get("_fit_args_eq")
+                    if not _fa_mc:
+                        st.info("Click **Fit** once with the current "
+                                "script and data to enable Monte Carlo.")
+                    else:
+                        # Build the list of NUISANCE parameters: anything
+                        # in conc0 not in fit_conc_keys, anything in
+                        # titrant_mMs not in fit_titrant_keys, plus V0.
+                        _params_mc = _fa_mc.get("params") or {}
+                        _conc0   = _params_mc.get("conc0", {}) or {}
+                        _titmMs  = _params_mc.get("titrant_mMs", {}) or {}
+                        _fck     = set(_fa_mc.get("fit_conc_keys", []) or [])
+                        _ftk     = set(_fa_mc.get("fit_titrant_keys", []) or [])
+                        _conc_nuis    = [n for n in _conc0  if n not in _fck]
+                        _titrant_nuis = [n for n in _titmMs if n not in _ftk]
+
+                        st.caption("Default σ = 0 % (no contribution). "
+                                   "Set realistic relative uncertainties "
+                                   "for each prep-error source. Typical "
+                                   "values: 2–3 % for gravimetric stock "
+                                   "concentrations, 0.5–1 % for "
+                                   "volumetric V₀.")
+                        # Input grid: per-component relative σ
+                        _specs: dict = {}
+                        _all_inputs: list = []
+                        for _n in _conc_nuis:
+                            _all_inputs.append(("conc0",
+                                                 f"conc0[{_n}] (nominal "
+                                                 f"{_conc0[_n]:.3g} mM)",
+                                                 _n))
+                        for _n in _titrant_nuis:
+                            _all_inputs.append(("titrant",
+                                                 f"titrant[{_n}] "
+                                                 f"(nominal "
+                                                 f"{_titmMs[_n]:.3g} mM)",
+                                                 _n))
+                        if "V0_mL" in _params_mc:
+                            _all_inputs.append(("V0_mL",
+                                                 f"V₀ (nominal "
+                                                 f"{_params_mc['V0_mL']:.3g} mL)",
+                                                 None))
+
+                        if not _all_inputs:
+                            st.info("No nuisance parameters to sample "
+                                    "— every experimental quantity is "
+                                    "already a fit variable.")
+                        else:
+                            # Render in 2-column grid
+                            _ncols_inp = 2
+                            _cols_inp  = st.columns(_ncols_inp)
+                            for _ii, (_kind, _label, _name) in enumerate(_all_inputs):
+                                _col = _cols_inp[_ii % _ncols_inp]
+                                _val = _col.number_input(
+                                    f"σ on {_label} (%)",
+                                    min_value=0.0, max_value=50.0,
+                                    value=0.0, step=0.1,
+                                    key=f"_mc_sig_eq_{_kind}_{_name}",
+                                    format="%.2f")
+                                if _val > 0:
+                                    if _kind == "conc0":
+                                        _specs[f"conc0:{_name}"]   = _val / 100.0
+                                    elif _kind == "titrant":
+                                        _specs[f"titrant:{_name}"] = _val / 100.0
+                                    elif _kind == "V0_mL":
+                                        _specs["V0_mL"]           = _val / 100.0
+
+                            _ci_n, _ci_p = st.columns([1, 1])
+                            _n_mc = _ci_n.number_input(
+                                "MC iterations",
+                                min_value=50, max_value=5000, value=500,
+                                step=50, key="_mc_iter_eq")
+                            _mc_par = _ci_p.checkbox(
+                                "Parallel (use all cores)",
+                                value=False, key="_mc_par_eq")
+
+                            if not _specs:
+                                st.warning("All uncertainties are 0 % — "
+                                           "MC would be degenerate. Set "
+                                           "at least one σ > 0 before "
+                                           "running.")
+
+                            if st.button("Run Monte Carlo",
+                                          key="_mc_run_eq",
+                                          disabled=(not _specs)):
+                                _pb_mc = st.progress(0.0, text="MC running…")
+                                _cb_mc = lambda i, N: _pb_mc.progress(
+                                    min(i / max(N, 1), 1.0),
+                                    text=f"MC {i}/{N}")
+                                _jobs_mc = -1 if _mc_par else 1
+                                try:
+                                    _mr = None
+                                    if _fa_mc.get("use_spectra_fit"):
+                                        _mr = ebs.monte_carlo_spectra(
+                                            _fa_mc["parsed_fit"], _fa_mc["network"],
+                                            _fa_mc["spectra_data_fit"],
+                                            _fa_mc["params"], _fa_mc["start_logK"],
+                                            _fa_mc["fit_keys"],
+                                            _fa_mc["x_expr"],
+                                            wl_min=_fa_mc["wl_min"],
+                                            wl_max=_fa_mc["wl_max"],
+                                            nuisance_specs=_specs,
+                                            n_iter=int(_n_mc),
+                                            n_jobs=_jobs_mc,
+                                            tolerance=_fa_mc["tolerance"],
+                                            maxiter=_fa_mc["maxiter"],
+                                            constraints=_fa_mc["constraints"],
+                                            fit_conc_keys=_fa_mc["fit_conc_keys"],
+                                            fit_titrant_keys=_fa_mc["fit_titrant_keys"],
+                                            allow_negative_eps=_fa_mc.get("allow_neg_eps", False),
+                                            progress_callback=_cb_mc)
+                                    elif _fa_mc.get("use_nmr_fit") and _fa_mc.get("nmr_mode") == "shift":
+                                        _mr = ebs.monte_carlo_nmr_shift(
+                                            _fa_mc["parsed_fit"], _fa_mc["network"], _fa_mc["nmr_data_fit"],
+                                            _fa_mc["params"], _fa_mc["start_logK"],
+                                            _fa_mc["fit_keys"], _fa_mc["x_expr"],
+                                            nuisance_specs=_specs,
+                                            n_iter=int(_n_mc), n_jobs=_jobs_mc,
+                                            tolerance=_fa_mc["tolerance"],
+                                            maxiter=_fa_mc["maxiter"],
+                                            constraints=_fa_mc["constraints"],
+                                            fit_conc_keys=_fa_mc["fit_conc_keys"],
+                                            fit_titrant_keys=_fa_mc["fit_titrant_keys"],
+                                            progress_callback=_cb_mc)
+                                    elif _fa_mc.get("use_nmr_fit") and _fa_mc.get("nmr_mode") == "integration":
+                                        _mr = ebs.monte_carlo_nmr_integration(
+                                            _fa_mc["parsed_fit"], _fa_mc["network"], _fa_mc["nmr_data_fit"],
+                                            _fa_mc["params"], _fa_mc["start_logK"],
+                                            _fa_mc["fit_keys"], _fa_mc["x_expr"],
+                                            nuisance_specs=_specs,
+                                            n_iter=int(_n_mc), n_jobs=_jobs_mc,
+                                            tolerance=_fa_mc["tolerance"],
+                                            maxiter=_fa_mc["maxiter"],
+                                            constraints=_fa_mc["constraints"],
+                                            fit_conc_keys=_fa_mc["fit_conc_keys"],
+                                            fit_titrant_keys=_fa_mc["fit_titrant_keys"],
+                                            progress_callback=_cb_mc)
+                                    elif _fa_mc.get("use_nmr_fit") and _fa_mc.get("nmr_mode") == "mixed":
+                                        _mr = ebs.monte_carlo_nmr_mixed(
+                                            _fa_mc["parsed_fit"], _fa_mc["network"], _fa_mc["nmr_data_fit"],
+                                            _fa_mc["params"], _fa_mc["start_logK"],
+                                            _fa_mc["fit_keys"], _fa_mc["x_expr"],
+                                            nuisance_specs=_specs,
+                                            n_iter=int(_n_mc), n_jobs=_jobs_mc,
+                                            tolerance=_fa_mc["tolerance"],
+                                            maxiter=_fa_mc["maxiter"],
+                                            constraints=_fa_mc["constraints"],
+                                            fit_conc_keys=_fa_mc["fit_conc_keys"],
+                                            fit_titrant_keys=_fa_mc["fit_titrant_keys"],
+                                            progress_callback=_cb_mc)
+                                    else:
+                                        _mr = ebs.monte_carlo_conc(
+                                            _fa_mc["parsed_fit"], _fa_mc["network"], _fa_mc["exp_data_fit"],
+                                            _fa_mc["params"], _fa_mc["start_logK"],
+                                            _fa_mc["fit_keys"], _fa_mc["x_expr"],
+                                            nuisance_specs=_specs,
+                                            n_iter=int(_n_mc), n_jobs=_jobs_mc,
+                                            tolerance=_fa_mc["tolerance"],
+                                            maxiter=_fa_mc["maxiter"],
+                                            use_lbfgsb=_fa_mc.get("use_lbfgsb", True),
+                                            use_neldermead=_fa_mc.get("use_neldermead", True),
+                                            constraints=_fa_mc["constraints"],
+                                            fit_conc_keys=_fa_mc["fit_conc_keys"],
+                                            fit_titrant_keys=_fa_mc["fit_titrant_keys"],
+                                            progress_callback=_cb_mc)
+                                    if _mr is not None:
+                                        st.session_state["_mc_result_eq"] = _mr
+                                except Exception as _mce:
+                                    _pb_mc.empty()
+                                    import traceback as _tb_mc
+                                    st.error(f"Monte Carlo failed: {_mce}")
+                                    st.caption(_tb_mc.format_exc())
+                                else:
+                                    _pb_mc.empty()
+
+                        _mr = st.session_state.get("_mc_result_eq")
+                        if _mr is not None and not _mr.get("mc_se"):
+                            st.warning(f"Monte Carlo: "
+                                        f"{_mr.get('best_message', 'no result')}")
+                        if _mr and _mr.get("mc_se"):
+                            st.caption(
+                                f"{_mr['n_success']}/{_mr['n_iter']} "
+                                f"iterations succeeded "
+                                f"({_mr['wall_seconds']:.1f} s)")
+                            # Result table: param | unit | nominal | MC σ
+                            # | 95 % CI; comparable to the bootstrap table
+                            _rows_mc = []
+                            _kinds_mc = _mr.get("param_kinds", {}) or {}
+                            for _n, _se in _mr["mc_se"].items():
+                                _fv   = _mr["best_fit"].get(_n, float("nan"))
+                                _kind = _kinds_mc.get(_n, "log")
+                                if   _kind == "log":       _ust = "log10"
+                                elif _kind == "linear_k":  _ust = "linear"
+                                else:                       _ust = "mM"
+                                _lo = _mr["mc_ci_lo"].get(_n, float("nan"))
+                                _hi = _mr["mc_ci_hi"].get(_n, float("nan"))
+                                _rows_mc.append({
+                                    "parameter": _n,
+                                    "unit":      _ust,
+                                    "θ_nominal": f"{_fv:+.2e}",
+                                    "MC σ":      (f"{_se:.2e}"
+                                                   if np.isfinite(_se) else "—"),
+                                    "95 % CI (from samples)":
+                                        (f"[{_lo:+.2e}, {_hi:+.2e}]"
+                                         if np.isfinite(_lo) and np.isfinite(_hi)
+                                         else "—"),
+                                })
+                            st.dataframe(_rows_mc, hide_index=True,
+                                          use_container_width=True)
+                            st.caption("**Comparing with bootstrap σ above** "
+                                       "tells you which uncertainty source "
+                                       "dominates: residual noise (bootstrap) "
+                                       "or experimental prep error (MC).  If "
+                                       "MC σ ≳ bootstrap σ, tightening stock "
+                                       "concentrations / volume measurements "
+                                       "will improve precision more than "
+                                       "noise reduction.")
+            _mc_eq_frag()
+
+        # ── v2 Local sensitivity test (Masson/beta) ─────────────────────
+        # Paired-difference, no-refit sensitivity probe over a user-
+        # selected subset of variables.  Yields f, σ_cond, σ_marg, and
+        # the coupling ratio σ_marg/σ_cond (square-root of the VIF) —
+        # the latter is the diagnostic answer to "is parameter X
+        # individually identified or only through coupling?"
+        if fit_stats:
+            @_fragment
+            def _lst_eq_frag():
+                if st.checkbox("🎚️ Show Local sensitivity test (Masson)",
+                               value=False, key="_show_lst_eq",
+                               help="Probes the local SSR surface around "
+                                    "the optimum by perturbing each "
+                                    "selected variable by ±δ in log10 "
+                                    "space.  The paired-difference "
+                                    "construction cancels cross-coupling "
+                                    "terms exactly, isolating each "
+                                    "variable's intrinsic stiffness.  "
+                                    "Compared with the marginal Hessian σ, "
+                                    "the ratio diagnoses parameter "
+                                    "coupling.  3^N grid evaluations — "
+                                    "tractable up to ~6–7 selected "
+                                    "variables."):
+                    _fa_lst = st.session_state.get("_fit_args_eq")
+                    if not _fa_lst:
+                        st.info("Click **Fit** once with the current "
+                                "script and data to enable the local "
+                                "sensitivity test.")
+                    else:
+                        # ── Build the full variable list ──────────────
+                        _all_K = list(_fa_lst.get("start_logK", {}).keys())
+                        _params_lst = _fa_lst.get("params") or {}
+                        _all_C = list((_params_lst.get("conc0",       {}) or {}).keys())
+                        _all_T = list((_params_lst.get("titrant_mMs", {}) or {}).keys())
+                        _has_V0 = "V0_mL" in _params_lst
+
+                        # Sets of fitted parameter names (CHECKED by default)
+                        _fit_K = set(_fa_lst.get("fit_keys",         []) or [])
+                        _fit_C = set(_fa_lst.get("fit_conc_keys",    []) or [])
+                        _fit_T = set(_fa_lst.get("fit_titrant_keys", []) or [])
+
+                        st.caption("Pick the variables to include in the "
+                                   "test. Fitted parameters are checked "
+                                   "by default; any held-fixed quantity "
+                                   "can also be tested.")
+
+                        # 3-column checkbox grid, sectioned by type
+                        _selected: list = []
+                        if _all_K:
+                            st.write("**Equilibrium constants**")
+                            _cK = st.columns(min(3, max(1, len(_all_K))))
+                            for _ii, _n in enumerate(_all_K):
+                                if _cK[_ii % len(_cK)].checkbox(
+                                        _n, value=(_n in _fit_K),
+                                        key=f"_lst_eq_chk_K_{_n}"):
+                                    _selected.append(_n)
+                        if _all_C:
+                            st.write("**Initial concentrations**")
+                            _cC = st.columns(min(3, max(1, len(_all_C))))
+                            for _ii, _n in enumerate(_all_C):
+                                if _cC[_ii % len(_cC)].checkbox(
+                                        _n, value=(_n in _fit_C),
+                                        key=f"_lst_eq_chk_C_{_n}"):
+                                    _selected.append(_n)
+                        if _all_T:
+                            st.write("**Titrant stock concentrations**")
+                            _cT = st.columns(min(3, max(1, len(_all_T))))
+                            for _ii, _n in enumerate(_all_T):
+                                if _cT[_ii % len(_cT)].checkbox(
+                                        f"{_n} (titrant)",
+                                        value=(_n in _fit_T),
+                                        key=f"_lst_eq_chk_T_{_n}"):
+                                    _selected.append(_n)
+                        if _has_V0:
+                            if st.checkbox("V₀ (initial volume)",
+                                            value=False, key="_lst_eq_chk_V0"):
+                                _selected.append("V0_mL")
+
+                        # Step + parallel controls
+                        _csz, _cpar = st.columns([1, 1])
+                        _step_lst = _csz.number_input(
+                            "Step δ (log10 units)",
+                            min_value=0.001, max_value=1.0,
+                            value=0.10, step=0.01, format="%.3f",
+                            key="_lst_eq_step")
+                        _par_lst = _cpar.checkbox(
+                            "Parallel (use all cores)",
+                            value=True, key="_lst_eq_par")
+
+                        # Scaling warning + run button
+                        _N = len(_selected)
+                        if _N == 0:
+                            st.warning("Select at least one variable to "
+                                       "include in the test.")
+                            _can_run = False
+                        else:
+                            n_grid = 3 ** _N
+                            if _N >= 8:
+                                st.error(f"⚠ {_N} variables → 3^{_N} = "
+                                          f"{n_grid:,} evaluations. "
+                                          "That's likely too slow even "
+                                          "parallel. Consider "
+                                          "deselecting some.")
+                            elif _N >= 6:
+                                st.warning(f"⚠ {_N} variables → 3^{_N} = "
+                                            f"{n_grid:,} grid points — "
+                                            "expect several minutes.")
+                            else:
+                                st.caption(f"Grid: 3^{_N} = {n_grid:,} "
+                                            "RMSE evaluations.")
+                            _can_run = True
+
+                        if st.button("Run local sensitivity test",
+                                      key="_lst_eq_run", disabled=not _can_run):
+                            _pb = st.progress(0.0, text="Local sensitivity running…")
+                            _cb = lambda i, N: _pb.progress(
+                                min(i / max(N, 1), 1.0),
+                                text=f"Local sensitivity {i}/{N}")
+                            _jobs = -1 if _par_lst else 1
+                            # Build sigma_marg dict from Hessian param_errors
+                            _pe = fit_stats.get("param_errors", {}) or {}
+                            _sigma_marg = {k: float(v) for k, v in _pe.items()
+                                            if v is not None and np.isfinite(v)}
+                            try:
+                                _lr = compute_local_sensitivity(
+                                    _fa_lst, _selected,
+                                    step=float(_step_lst), n_jobs=_jobs,
+                                    sigma_marg=_sigma_marg,
+                                    fit_stats=fit_stats,
+                                    progress_callback=_cb)
+                                if _lr is not None:
+                                    st.session_state["_lst_result_eq"] = _lr
+                            except Exception as _le:
+                                _pb.empty()
+                                import traceback as _tb_lst
+                                st.error(f"Local sensitivity failed: {_le}")
+                                st.caption(_tb_lst.format_exc())
+                            else:
+                                _pb.empty()
+
+                        _lr = st.session_state.get("_lst_result_eq")
+                        if _lr is not None and _lr.get("f"):
+                            st.caption(
+                                f"{_lr['n_success']}/{_lr['n_grid']} "
+                                f"grid points evaluated ({_lr['wall_seconds']:.1f} s, "
+                                f"N_data = {_lr['n_data']}, "
+                                f"RMSE_opt = {_lr['rmse_opt']:.3e})")
+                            _rows = []
+                            for _v in _lr["selected_vars"]:
+                                _f  = _lr["f"].get(_v, float("nan"))
+                                _sc = _lr["sigma_cond"].get(_v, float("nan"))
+                                _sm = _lr["sigma_marg"].get(_v, float("nan"))
+                                _cp = _lr["coupling"].get(_v, float("nan"))
+                                if   np.isnan(_cp):     _cp_tag = "n/a"
+                                elif _cp <= 1.5:        _cp_tag = f"{_cp:.2f} ✓"
+                                elif _cp <= 3.0:        _cp_tag = f"{_cp:.2f} ⚠"
+                                else:                   _cp_tag = f"{_cp:.2f} ⚠⚠"
+                                _rows.append({
+                                    "variable": _v,
+                                    "ξ (% RMSE per ±δ)":
+                                        (f"{_f*100:+.2f}%"
+                                          if np.isfinite(_f) else "—"),
+                                    "σ_cond (log10)":
+                                        (f"{_sc:.2e}" if np.isfinite(_sc) else "—"),
+                                    "σ_marg (Hessian, log10)":
+                                        (f"{_sm:.2e}" if np.isfinite(_sm) else "—"),
+                                    "Coupling factor":
+                                        _cp_tag,
+                                })
+                            st.dataframe(_rows, hide_index=True,
+                                          use_container_width=True)
+                            st.caption(
+                                "**σ_cond** is the conditional CI half-width "
+                                "(other variables held fixed); **σ_marg** is "
+                                "the marginal Hessian σ (other variables "
+                                "free to refit).  **Coupling factor** = "
+                                "σ_marg / σ_cond ≥ 1: ≤ 1.5 means the "
+                                "variable is independently constrained by "
+                                "the data; 1.5–3.0 indicates mild coupling; "
+                                "> 3 signals that the variable is mostly "
+                                "identified through coupling with another, "
+                                "and its individual value should be "
+                                "interpreted cautiously.")
+                            # Per-variable expandable: show each of the
+                            # 2·3^(N-1) paired differences so the user
+                            # can see whether the mean f comes from
+                            # uniformly small diffs (truly insensitive)
+                            # or from sign-flipping diffs averaging to
+                            # zero (non-quadratic / off-optimum anchor).
+                            _drecs = _lr.get("diff_records", {})
+                            if _drecs:
+                                with st.expander("Show individual paired differences"):
+                                    for _v in _lr["selected_vars"]:
+                                        _records = _drecs.get(_v, [])
+                                        if not _records: continue
+                                        st.markdown(f"**{_v}** — "
+                                                    f"{len(_records)} paired diffs, "
+                                                    f"mean = {_lr['f'].get(_v, float('nan'))*100:+.3f}%")
+                                        _drows = []
+                                        for _rec in _records:
+                                            _sign_lbl = ("+δ" if _rec["sign"] > 0 else "−δ")
+                                            _other_str = ", ".join(
+                                                f"{k}={v}" for k, v in _rec["others"].items())
+                                            _drows.append({
+                                                f"sign of δ_{_v}": _sign_lbl,
+                                                "other variables": _other_str or "—",
+                                                "RMSE (unp.)":  f"{_rec.get('rmse_unp', float('nan')):.6e}",
+                                                "RMSE (pert.)": f"{_rec.get('rmse_pert', float('nan')):.6e}",
+                                                "diff r (%)": f"{_rec['diff']*100:+.4f}%",
+                                            })
+                                        st.dataframe(_drows, hide_index=True,
+                                                      use_container_width=True)
+            _lst_eq_frag()
+
+        # ── v2 model comparison (AIC / BIC / F-test / Akaike weights) ────
+        if fit_stats:
+            @_fragment
+            def _cmp_eq_frag():
+                if st.checkbox("⚖️ Show model comparison (AIC / BIC / F-test)",
+                               value=False, key="_show_cmp_eq"):
+                    st.caption(
+                        "Fit an alternative reaction model on the same experimental "
+                        "data and rank the two by information criteria.  Akaike "
+                        "weights translate ΔAIC into an evidence ratio "
+                        "(w_A / w_B = exp(ΔAIC / 2)).  Tick **Nested?** when the "
+                        "simpler model is a special case of the more complex one "
+                        "(e.g. 1:1 vs 1:2 binding) to enable the F-test.")
+                    _fa_eq = st.session_state.get("_fit_args_eq")
+                    _alt_script = st.text_area(
+                        "Alternative model script",
+                        height=180, key="_alt_script_text",
+                        placeholder=(
+                            "$concentrations\n"
+                            "G0 = 1.00 mM\n\n"
+                            "$volumes\nV0 = 500 uL\n\n"
+                            "$titrant\nHt = 10.0 mM\n\n"
+                            "$reactions\n"
+                            "G + H = GH;     log K1 = 4.0\n"
+                            "GH + H = GH2;   log K2 = 2.0\n\n"
+                            "$plot\nxmax = 3.00\nx = H0/G0\ny = G, H, GH, GH2"))
+                    _nested = st.checkbox(
+                        "Nested? (enables F-test)", value=True, key="_alt_nested")
+                    if st.button("Fit alternative & compare", key="_alt_compare_btn"):
+                        if not _fa_eq:
+                            st.warning("Click **Fit** with the current script first.")
+                        elif not _alt_script.strip():
+                            st.warning("Paste an alternative reaction model above.")
+                        else:
+                            try:
+                                from equilibrist_curve import _find_maxEquiv as _fmE
+                                _alt_p = parse_script(_alt_script)
+                                _alt_net = build_network(_alt_p)
+                                _alt_cv = {k[:-1] if k.endswith('0') else k: float(v)
+                                           for k, v in _alt_p['concentrations'].items()}
+                                _alt_tm = {k[:-1] if (k.endswith('t') or k.endswith('0')) else k: float(v)
+                                           for k, v in _alt_p['titrant'].items()}
+                                _alt_V0 = list(_alt_p['volumes'].values())[0]
+                                _alt_xmax = float(_alt_p.get('plot_xmax', 3.0))
+                                _alt_pri  = list(_alt_p['concentrations'].keys())[0]
+                                _alt_pri_r = _alt_pri[:-1] if _alt_pri.endswith('0') else _alt_pri
+                                _alt_xexpr = _alt_p['plot_x_expr']
+                                _alt_maxEq = _fmE(_alt_xexpr, _alt_xmax, _alt_p, _alt_cv, float(_alt_V0),
+                                                  _alt_net['titrant_free_names'],
+                                                  _alt_net['titrant_keys'], _alt_tm,
+                                                  _alt_p.get('titrant_ratios', {}) or {},
+                                                  _alt_p['titrant_is_solid'], _alt_pri_r)
+                                _alt_params = {
+                                    "conc0": _alt_cv, "V0_mL": float(_alt_V0),
+                                    "titrant_name": _alt_net.get('titrant_name', ''),
+                                    "titrant_key":  _alt_net.get('titrant_key',  ''),
+                                    "titrant_free_names": _alt_net['titrant_free_names'],
+                                    "titrant_keys": _alt_net['titrant_keys'],
+                                    "titrant_mMs": _alt_tm,
+                                    "titrant_ratios": _alt_p.get('titrant_ratios', {}) or {},
+                                    "titrant_is_solid": _alt_p["titrant_is_solid"],
+                                    "maxEquiv": _alt_maxEq, "nPts": 100,
+                                    "primary_component": _alt_pri_r,
+                                }
+                                _alt_logK = {e['kname']: float(e['logK'])
+                                             for e in _alt_p['equilibria']}
+                                _alt_keys = list(_alt_logK.keys())
+                                with st.spinner("Fitting alternative model…"):
+                                    if _fa_eq["use_spectra_fit"]:
+                                        _ok2, _f2, _s2, _m2 = fit_spectra(
+                                            _alt_p, _alt_net, _fa_eq["spectra_data_fit"],
+                                            _alt_params, _alt_logK, _alt_keys, _alt_xexpr,
+                                            _fa_eq["wl_min"], _fa_eq["wl_max"],
+                                            _fa_eq["tolerance"], _fa_eq["maxiter"],
+                                            constraints=_alt_p.get('constraints', []),
+                                            allow_negative_eps=_fa_eq.get("allow_neg_eps", False))
+                                    elif _fa_eq["use_nmr_fit"] and _fa_eq["nmr_mode"] == "shift":
+                                        _ok2, _f2, _s2, _m2 = fit_nmr_shifts(
+                                            _alt_p, _alt_net, _fa_eq["nmr_data_fit"],
+                                            _alt_params, _alt_logK, _alt_keys, _alt_xexpr,
+                                            _fa_eq["tolerance"], _fa_eq["maxiter"],
+                                            constraints=_alt_p.get('constraints', []))
+                                    elif _fa_eq["use_nmr_fit"] and _fa_eq["nmr_mode"] == "integration":
+                                        _ok2, _f2, _s2, _m2 = fit_nmr_integration(
+                                            _alt_p, _alt_net, _fa_eq["nmr_data_fit"],
+                                            _alt_params, _alt_logK, _alt_keys, _alt_xexpr,
+                                            _fa_eq["tolerance"], _fa_eq["maxiter"],
+                                            constraints=_alt_p.get('constraints', []))
+                                    elif _fa_eq["use_nmr_fit"] and _fa_eq["nmr_mode"] == "mixed":
+                                        _ok2, _f2, _s2, _m2 = fit_nmr_mixed(
+                                            _alt_p, _alt_net, _fa_eq["nmr_data_fit"],
+                                            _alt_params, _alt_logK, _alt_keys, _alt_xexpr,
+                                            _fa_eq["tolerance"], _fa_eq["maxiter"],
+                                            constraints=_alt_p.get('constraints', []))
+                                    else:
+                                        _ok2, _f2, _s2, _m2 = fit_parameters(
+                                            _alt_p, _alt_net, _fa_eq["exp_data_fit"] or {},
+                                            _alt_params, _alt_logK, _alt_keys, _alt_xexpr,
+                                            tolerance=_fa_eq["tolerance"],
+                                            maxiter=_fa_eq["maxiter"],
+                                            constraints=_alt_p.get('constraints', []))
+                                if not _ok2:
+                                    st.warning(f"Alternative model did not converge: {_m2}")
+                                else:
+                                    augment_stats(_s2)
+                                    st.session_state["_alt_stats"]  = _s2
+                                    st.session_state["_alt_fitted"] = dict(_f2)
+                            except Exception as _ce:
+                                import traceback as _tb_c
+                                st.error(f"Model comparison failed: {_ce}")
+                                st.caption(_tb_c.format_exc())
+                    # Render last comparison if available
+                    _s2 = st.session_state.get("_alt_stats")
+                    _f2 = st.session_state.get("_alt_fitted")
+                    if _s2 and fit_stats.get("aic") is not None and _s2.get("aic") is not None:
+                        cmp = compare_models(fit_stats, _s2, nested=_nested,
+                                             label_a="Current", label_b="Alternative")
+                        st.markdown(f"**{cmp['interpretation']}**")
+                        _kA = fit_stats.get('n_params', 0) or 0   # = p (manuscript convention)
+                        _kB = _s2.get('n_params', 0) or 0         # = p (manuscript convention)
+                        _crows = [
+                            {"Metric": "ℓ_max",
+                             "Current":     f"{fit_stats.get('log_likelihood', float('nan')):.3f}",
+                             "Alternative": f"{_s2.get('log_likelihood',  float('nan')):.3f}",
+                             "Δ (Alt − Cur)": f"{_s2.get('log_likelihood', 0)-fit_stats.get('log_likelihood', 0):+.3f}"},
+                            {"Metric": "SSR",
+                             "Current":     f"{fit_stats.get('ssr', float('nan')):.5g}",
+                             "Alternative": f"{_s2.get('ssr',  float('nan')):.5g}",
+                             "Δ (Alt − Cur)": f"{_s2.get('ssr', 0)-fit_stats.get('ssr', 0):+.5g}"},
+                            {"Metric": "p (fitted)",
+                             "Current": f"{_kA}", "Alternative": f"{_kB}",
+                             "Δ (Alt − Cur)": f"{_kB - _kA:+d}"},
+                            {"Metric": "AIC",
+                             "Current":     f"{cmp['aic_a']:.2f}",
+                             "Alternative": f"{cmp['aic_b']:.2f}",
+                             "Δ (Alt − Cur)": f"{cmp['delta_aic']:+.2f}"},
+                            {"Metric": "AICc",
+                             "Current":     f"{cmp['aicc_a']:.2f}",
+                             "Alternative": f"{cmp['aicc_b']:.2f}",
+                             "Δ (Alt − Cur)": f"{cmp['delta_aicc']:+.2f}"},
+                            {"Metric": "BIC",
+                             "Current":     f"{cmp['bic_a']:.2f}",
+                             "Alternative": f"{cmp['bic_b']:.2f}",
+                             "Δ (Alt − Cur)": f"{cmp['delta_bic']:+.2f}"},
+                        ]
+                        st.dataframe(_crows, hide_index=True)
+                        st.markdown(
+                            f"**Akaike weights**: "
+                            f"Current = **{cmp['weight_a']:.3f}** · "
+                            f"Alternative = **{cmp['weight_b']:.3f}**  \n"
+                            f"_(weight ≈ probability this model is the better of the two)_")
+                        if _nested and np.isfinite(cmp['f_statistic']):
+                            _dp = abs(_kB - _kA)
+                            if cmp['f_statistic'] == 0.0 and cmp['f_p_value'] == 1.0:
+                                st.markdown(
+                                    f"**F-test** (Δp = {_dp}): the more complex model "
+                                    "does *not* reduce SSR → no evidence whatsoever "
+                                    "for the additional parameter(s).")
+                            else:
+                                st.markdown(
+                                    f"**F-test** (Δp = {_dp}): "
+                                    f"F = {cmp['f_statistic']:.3f}, "
+                                    f"p = {cmp['f_p_value']:.4g}")
+                        # Show alternative model's fitted parameters
+                        if _f2:
+                            st.markdown("**Alternative model fitted constants:**")
+                            _alt_rows = []
+                            for n_alt, v_alt in _f2.items():
+                                _e_alt = _s2.get('param_errors', {}).get(n_alt)
+                                _alt_rows.append({
+                                    "Parameter": n_alt,
+                                    "log K": f"{v_alt:+.4f}",
+                                    "± σ (Hessian)": (f"{_e_alt:.4f}"
+                                                      if _e_alt is not None and np.isfinite(_e_alt)
+                                                      else "—"),
+                                })
+                            st.dataframe(_alt_rows, hide_index=True)
+
+            _cmp_eq_frag()
 
         # ── Fitted equilibrium constants ─────────────────────────
         param_values    = fit_stats.get("param_values", {})
@@ -3290,16 +7067,29 @@ with col2:
                 st.caption("Concentrations averaged from all signals of each species")
 
         # ── Pure-species chemical shifts ──────────────────────────────────────
-        # Show whenever shift data was fitted (shift or mixed mode)
+        # Show whenever shift data was fitted (shift or mixed mode).
+        # Display rule (matches legacy behavior when noref is absent):
+        #   • Default (no noref):       show absolute δ = δ_obs(V=0) + dd.
+        #   • noref WITH read::         show absolute δ (anchored).
+        #   • noref WITHOUT read::      show Δδ relative to math reference;
+        #     absolute scale is undetermined (uniform-shift symmetry).
+        _nmr_noref   = bool(fit_stats.get("nmr_noref", False))
+        _ps_anchored = bool(fit_stats.get("pure_shifts_anchored", False))
+        _show_abs    = (not _nmr_noref) or _ps_anchored
+        _ps_dfree    = fit_stats.get("delta_free", {}) or {}
         if pure_shifts_disp:
-            st.write("**Pure-species chemical shifts (ppm):**")
+            if _show_abs:
+                st.write("**Pure-species chemical shifts (ppm):**")
+            else:
+                st.write("**Pure-species chemical shifts — Δδ relative to math reference (ppm):**")
             all_sp_cols = []
             rows_ps = []
             for tgt, col_dict in pure_shifts_disp.items():
                 for col, sp_dict in col_dict.items():
                     row = {"Signal": col}
-                    for sp, delta in sp_dict.items():
-                        row[sp] = f"{delta:.4f}"
+                    df0 = float(_ps_dfree.get(col, 0.0)) if _show_abs else 0.0
+                    for sp, dd_val in sp_dict.items():
+                        row[sp] = f"{df0 + dd_val:.4f}"
                         if sp not in all_sp_cols:
                             all_sp_cols.append(sp)
                     rows_ps.append(row)
@@ -3307,7 +7097,11 @@ with col2:
                 df_ps = pd.DataFrame(rows_ps).set_index("Signal")
                 ordered = [c for c in all_sp_cols if c in df_ps.columns]
                 st.dataframe(df_ps[ordered], width='stretch')
-                st.caption("Each row = one NMR signal; columns = δ of each pure species (ppm)")
+                if _show_abs:
+                    st.caption("Each row = one NMR signal; columns = δ of each pure species (ppm)")
+                else:
+                    st.caption("Each row = one NMR signal; columns = Δδ relative to math reference (ppm). "
+                               "Add a `read:` anchor in $nmr to recover absolute δ.")
 
         # ── Mixed mode: summary ──────────────────────────────────────────────
         if fit_mode == "mixed":
